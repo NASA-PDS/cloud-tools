@@ -1,12 +1,17 @@
+#!/usr/bin/env python
+"""Summarize S3 inventory.
+
+This script uses the boto3 library to summarize 1+ S3 inventory files.
+"""
+import csv
+import gzip
 import os
 import sys
-import gzip
-import csv
 
 
 def process_inventory_file(file_path):
-    """
-    Process a single gzipped CSV inventory file.
+    """Process a single gzipped CSV inventory file.
+
     Assumes the object size is in the third column (index 2).
 
     Returns:
@@ -17,27 +22,26 @@ def process_inventory_file(file_path):
     total_size = 0
 
     try:
-        with gzip.open(file_path, mode='rt', newline='') as gz_file:
+        with gzip.open(file_path, mode="rt", newline="") as gz_file:
             reader = csv.reader(gz_file)
             for row in reader:
                 if len(row) < 3:
-                    continue  # skip if row doesn't have enough columns
+                    continue  # Skip if row doesn't have enough columns.
                 try:
                     size = int(row[2])
                 except ValueError:
-                    # If conversion fails, skip this row.
+                    # Skip this row if conversion fails.
                     continue
                 total_size += size
                 count += 1
-    except Exception as e:
-        print(f"Error processing file {file_path}: {e}")
+    except Exception as error:
+        print(f"Error processing file {file_path}: {error}")
 
     return count, total_size
 
 
 def process_inventory_directory(directory):
-    """
-    Process all gzipped CSV inventory files in a directory.
+    """Process all gzipped CSV inventory files in a directory.
 
     Returns:
         total_count (int): Total number of objects across all files.
@@ -46,8 +50,8 @@ def process_inventory_directory(directory):
     total_count = 0
     overall_size = 0
 
-    # Walk through directory to find all .gz files
-    for root, dirs, files in os.walk(directory):
+    # Walk through directory to find all .gz files.
+    for root, _dirs, files in os.walk(directory):
         for file in files:
             if file.endswith(".gz"):
                 file_path = os.path.join(root, file)
@@ -60,6 +64,7 @@ def process_inventory_directory(directory):
 
 
 def main():
+    """main."""
     if len(sys.argv) != 2:
         print("Usage: python inventory_process.py <directory_path>")
         sys.exit(1)
