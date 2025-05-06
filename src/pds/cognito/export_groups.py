@@ -1,8 +1,7 @@
 """Extract the user groups and members from the identified Cognito user pool."""
-
 import datetime
-import sys
 import json
+import sys
 
 import boto3
 
