@@ -1,5 +1,4 @@
 """Extract the list of users from the identified Cognito user pool."""
-import datetime
 import sys
 
 import boto3
@@ -42,15 +41,9 @@ def extract_values(header_list, user_record):
     return result
 
 
-def datetimeconverter(o):
-    """Ensure that datetimes are handled as strings."""
-    if isinstance(o, datetime.datetime):
-        return str(o)
-
-
 # Process the cognito user pool
 
-if len(sys.argv) <= 1 or len(sys.argv) != 4:
+if len(sys.argv) != 4:
     print(f"Usage:\n\t{sys.argv[0]} <cognito_user_pool_id> <aws_region> <page_size>")
     print("\n\tpage_size has a ceiling set by AWS, which is currently 60")
     sys.exit(1)
