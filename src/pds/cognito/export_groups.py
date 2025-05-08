@@ -38,7 +38,7 @@ while has_next_page:
         has_next_page = bool(next_page_token)
     except client.exceptions.ClientError as e:
         print(f"Error listing groups: {e}")
-        break
+        sys.exit(1)
 
 # Get details for each group
 for group in groups:
