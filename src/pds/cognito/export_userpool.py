@@ -1,4 +1,5 @@
 """Extract the list of users from the identified Cognito user pool."""
+
 import datetime
 import json
 import sys
@@ -6,8 +7,8 @@ import sys
 import boto3
 
 
-page_size = 60 # max allowable
-region = "us-west-2" # default
+page_size = 60  # max allowable
+region = "us-west-2"  # default
 
 
 def datetimeconverter(o):

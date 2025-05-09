@@ -15,10 +15,10 @@ import boto3
 # for how the JSON can be consumed to create (empty) groups. The default set of groups follows
 # this same format.
 #
-# While this could be considered a list of magic strings, exposing them as an external config 
-# introduces a bit too much and likely unnecessary flexibility. 
+# While this could be considered a list of magic strings, exposing them as an external config
+# introduces a bit too much and likely unnecessary flexibility.
 #
-mandatory_attrs = {"RoleArn" : "", "Precedence" : 0, "Description" : 0}
+mandatory_attrs = {"RoleArn": "", "Precedence": 0, "Description": 0}
 
 
 def datetimeconverter(o):
@@ -58,7 +58,7 @@ while has_next_page:
 # Get details for each group
 for group in groups:
     group["Users"] = []
-    
+
     # Add in the mandatory attributes if not present
     for attr, def_value in mandatory_attrs.items():
         if group.get(attr) is None:
