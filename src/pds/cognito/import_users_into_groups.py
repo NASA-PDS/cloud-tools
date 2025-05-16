@@ -5,6 +5,24 @@ import sys
 import boto3
 
 
+def createGroup(client, user_pool_id, group):
+    """Create a group given the indicated user pool id and group data"""
+    role_arn = group.get("RoleArn")
+    precedence = 0 if group.get("Precedence") is None else group.get("Precedence")
+
+    if role_arn is None or len(role_arn) == 0:
+        client.create_group(GroupName=group["GroupName"],
+                            UserPoolId=user_pool_id,
+                            Description=group.get("Description"),
+                            Precedence=precedence)
+    else:
+        client.create_group(GroupName=group["GroupName"],
+                            UserPoolId=user_pool_id,
+                            Description=group.get("Description"),
+                            RoleArn=group.get("RoleArn"),
+                            Precedence=precedence)
+
+
 # Populate the groups from the indicated json file, first checking that all groups exist.
 
 if len(sys.argv) != 2:
@@ -20,24 +38,33 @@ with open(user_groups_json_file, "r") as json_file:
 user_pool_id = user_pool["UserPoolId"]
 user_groups = user_pool["Groups"]
 
-# check to make user all groups are present in the user pool
+# ensure all groups are present in the user pool
 group_counter = 0
-failure = False
 print(f"User Pool Id: {user_pool_id}")
 print("Verifying groups...")
+groups_to_create = []
 for group in user_groups:
+    group_exists = True
     try:
         print(f"Group {group_counter} : {group['GroupName']}", end=" ")
         response = client.get_group(GroupName=group["GroupName"], UserPoolId=user_pool_id)
+
+        print("Exists.")
     except client.exceptions.ResourceNotFoundException:
-        print("does not exist")
-        failure = True
-    print("OK")
+        print("Does not exist.")
+        groups_to_create.append(group)
+
     group_counter += 1
 
-if failure:
-    print("Missing groups have been detected, please create them or edit the json file appropriately")
-    sys.exit(1)
+if len(groups_to_create) > 0:
+    print(f"Creating {len(groups_to_create)} missing groups.")
+    for group in groups_to_create:
+        # while the user pool id is duplicated in each group record, we'll use the one
+        # retrieved from the root of the JSON - just for absolute consistency
+        createGroup(client, user_pool_id, group)
+        print(f"\t{group['GroupName']}")
+else:
+    print("All groups are present.")
 
 # Now that the groups have all been verified, add the users for each
 print("Adding users to groups.")
