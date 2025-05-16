@@ -38,7 +38,7 @@ with open(user_groups_json_file, "r") as json_file:
 user_pool_id = user_pool["UserPoolId"]
 user_groups = user_pool["Groups"]
 
-# ensure all groups are present in the user pool
+# ensure all groups are present in the user pool, creating them if necessary
 group_counter = 0
 print(f"User Pool Id: {user_pool_id}")
 print("Verifying groups...")
