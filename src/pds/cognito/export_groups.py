@@ -2,6 +2,7 @@
 import datetime
 import json
 import sys
+from typing import Union
 
 import boto3
 
@@ -18,7 +19,9 @@ import boto3
 # While this could be considered a list of magic strings, exposing them as an external config
 # introduces a bit too much and likely unnecessary flexibility.
 #
-mandatory_attrs = {"RoleArn": "", "Precedence": 0, "Description": 0}
+# jdy: 20250522 - since we aren't using the generated group JSON w/ terraform, we don't need
+#                 to establish default values for any fields.
+mandatory_attrs: dict[str, Union[str, int]] = {}
 
 
 def datetimeconverter(o):
