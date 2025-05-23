@@ -2,8 +2,26 @@
 import datetime
 import json
 import sys
+from typing import Union
 
 import boto3
+
+
+# NOTE: The following attributes, while not required from an AWS point of view, must appear
+# in the output from the perspective of using the generated JSON as terraform input. If they
+# are absent from a group definition, they will be added w/ the indicated 'empty' values.
+# For precedence, this is 0.
+#
+# See https://github.com/nasa-pds/pds-tf-modules/terraform/modules/cognito/cognito_groups.tf
+# for how the JSON can be consumed to create (empty) groups. The default set of groups follows
+# this same format.
+#
+# While this could be considered a list of magic strings, exposing them as an external config
+# introduces a bit too much and likely unnecessary flexibility.
+#
+# jdy: 20250522 - since we aren't using the generated group JSON w/ terraform, we don't need
+#                 to establish default values for any fields.
+mandatory_attrs: dict[str, Union[str, int]] = {}
 
 
 def datetimeconverter(o):
@@ -43,6 +61,12 @@ while has_next_page:
 # Get details for each group
 for group in groups:
     group["Users"] = []
+
+    # Add in the mandatory attributes if not present
+    for attr, def_value in mandatory_attrs.items():
+        if group.get(attr) is None:
+            group[attr] = def_value
+
     group_name = group["GroupName"]
     next_page_token = None
     has_next_page = True
