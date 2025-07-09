@@ -4,7 +4,6 @@ import sys
 from typing import Union
 
 import boto3
-
 from pds.cognito import common_cognito_defs
 
 

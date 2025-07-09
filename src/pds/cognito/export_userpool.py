@@ -3,7 +3,6 @@ import json
 import sys
 
 import boto3
-
 from pds.cognito import common_cognito_defs
 
 
