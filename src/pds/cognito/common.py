@@ -9,7 +9,7 @@ def datetimeconverter(o):
         return str(o)
 
 
-def get_args(arg_sub_list, exitStatus=1):
+def get_args(arg_sub_list, exit_status=1):
     """Extract common AWS options from given list."""
     page_size = 60  # max allowable
     region = "us-west-2"
@@ -19,13 +19,13 @@ def get_args(arg_sub_list, exitStatus=1):
         elif arg.startswith("--region"):
             region = arg.split("=")[1]
         else:
-            cognito_tool_usage(exitStatus)
+            cognito_tool_usage(exit_status)
 
     return page_size, region
 
 
-def cognito_tool_usage(exitStatus=None):
+def cognito_tool_usage(exit_status=None):
     """Provide command line instructions."""
     print(f"Usage:\n\t{sys.argv[0]} <cognito_user_pool_id> {{--page-size=<page_size>}} {{--region=<aws_region>}}")
-    if exitStatus is not None:
-        sys.exit(exitStatus)
+    if exit_status is not None:
+        sys.exit(exit_status)
