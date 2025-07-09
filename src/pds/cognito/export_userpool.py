@@ -1,42 +1,20 @@
 """Extract the list of users from the identified Cognito user pool."""
-import datetime
 import json
 import sys
 
 import boto3
 
-
-page_size = 60  # max allowable
-region = "us-west-2"  # default
-
-
-def datetimeconverter(o):
-    """Ensure that datetimes are handled as strings."""
-    if isinstance(o, datetime.datetime):
-        return str(o)
-
-
-def usage():
-    """Provide command line instructions."""
-    print(f"Usage:\n\t{sys.argv[0]} <cognito_user_pool_id> {{--page-size=<page_size>}} {{--region=<aws_region>}}")
+import common
 
 
 # Process the cognito user pool
 
 if len(sys.argv) > 4 or len(sys.argv) < 2:
-    usage()
-    sys.exit(1)
+    common.cognito_tool_usage(exitStatus=1)
 
 user_pool_id = sys.argv[1]
 
-for arg in sys.argv[2:]:
-    if arg.startswith("--page-size"):
-        page_size = int(arg.split("=")[1])
-    elif arg.startswith("--region"):
-        region = arg.split("=")[1]
-    else:
-        usage()
-        sys.exit(1)
+page_size, region = common.get_args(sys.argv[2:])
 
 cognito_client = boto3.client("cognito-idp", region)
 
@@ -59,4 +37,4 @@ while has_next_page:
         has_next_page = False
 
 user_pool = {"UserPoolId": f"{user_pool_id}", "Users": users}
-print(json.dumps(user_pool, indent=4, default=datetimeconverter))
+print(json.dumps(user_pool, indent=4, default=common.datetimeconverter))

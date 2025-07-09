@@ -1,10 +1,11 @@
 """Extract the user groups and members from the identified Cognito user pool."""
-import datetime
 import json
 import sys
 from typing import Union
 
 import boto3
+
+import common
 
 
 # NOTE: The following attributes, while not required from an AWS point of view, must appear
@@ -24,38 +25,15 @@ import boto3
 mandatory_attrs: dict[str, Union[str, int]] = {}
 
 
-page_size = 60  # max allowable
-region = "us-west-2"  # default
-
-
-def datetimeconverter(o):
-    """Ensure that datetimes are handled as strings."""
-    if isinstance(o, datetime.datetime):
-        return str(o)
-
-
-def usage():
-    """Provide command line instructions."""
-    print(f"Usage:\n\t{sys.argv[0]} <cognito_user_pool_id> {{--page-size=<page_size>}} {{--region=<aws_region>}}")
-
-
 # Process the groups for the indicated cognito user pool
 
 if len(sys.argv) > 4 or len(sys.argv) < 2:
-    usage()
-    sys.exit(1)
+    common.cognito_tool_usage(exitStatus=1)
 
 # Replace with your Cognito User Pool ID
 user_pool_id = sys.argv[1]
 
-for arg in sys.argv[2:]:
-    if arg.startswith("--page-size"):
-        page_size = int(arg.split("=")[1])
-    elif arg.startswith("--region"):
-        region = arg.split("=")[1]
-    else:
-        usage()
-        sys.exit(1)
+page_size, region = common.get_args(sys.argv[2:], exitStatus=1)
 
 client = boto3.client("cognito-idp", region)
 
@@ -70,7 +48,7 @@ while has_next_page:
             if next_page_token
             else client.list_groups(UserPoolId=user_pool_id, Limit=page_size)
         )
-        groups.extend([group for group in response["Groups"]])
+        groups.extend(list(response["Groups"]))
         next_page_token = response.get("NextToken")
         has_next_page = bool(next_page_token)
     except client.exceptions.ClientError as e:
@@ -105,4 +83,4 @@ for group in groups:
             print(f"Error listing users for {user_pool_id}/{group_name}: {e}")
 
 user_pool = {"UserPoolId": f"{user_pool_id}", "Groups": groups}
-print(json.dumps(user_pool, indent=4, default=datetimeconverter))
+print(json.dumps(user_pool, indent=4, default=common.datetimeconverter))
