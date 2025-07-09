@@ -16,15 +16,27 @@ def datetimeconverter(o):
         return str(o)
 
 
+def usage():
+    """Provide command line instructions."""
+    print(f"Usage:\n\t{sys.argv[0]} <cognito_user_pool_id> {{--page-size=<page_size>}} {{--region=<aws_region>}}")
+
+
 # Process the cognito user pool
 
-if len(sys.argv) > 3 or len(sys.argv) < 2:
-    print(f"Usage:\n\t{sys.argv[0]} <cognito_user_pool_id> {{<aws_region>}}")
+if len(sys.argv) > 4 or len(sys.argv) < 2:
+    usage()
     sys.exit(1)
 
 user_pool_id = sys.argv[1]
-if len(sys.argv) > 2:
-    region = sys.argv[2]
+
+for arg in sys.argv[2:]:
+    if arg.startswith("--page-size"):
+        page_size = int(arg.split("=")[1])
+    elif arg.startswith("--region"):
+        region = arg.split("=")[1]
+    else:
+        usage()
+        sys.exit(1)
 
 cognito_client = boto3.client("cognito-idp", region)
 

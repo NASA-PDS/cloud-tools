@@ -24,21 +24,40 @@ import boto3
 mandatory_attrs: dict[str, Union[str, int]] = {}
 
 
+page_size = 60  # max allowable
+region = "us-west-2"  # default
+
+
 def datetimeconverter(o):
     """Ensure that datetimes are handled as strings."""
     if isinstance(o, datetime.datetime):
         return str(o)
 
 
+def usage():
+    """Provide command line instructions."""
+    print(f"Usage:\n\t{sys.argv[0]} <cognito_user_pool_id> {{--page-size=<page_size>}} {{--region=<aws_region>}}")
+
+
 # Process the groups for the indicated cognito user pool
 
-if len(sys.argv) != 2:
-    print(f"Usage:\n\t{sys.argv[0]} <cognito_user_pool_id>")
+if len(sys.argv) > 4 or len(sys.argv) < 2:
+    usage()
     sys.exit(1)
 
 # Replace with your Cognito User Pool ID
 user_pool_id = sys.argv[1]
-client = boto3.client("cognito-idp")
+
+for arg in sys.argv[2:]:
+    if arg.startswith("--page-size"):
+        page_size = int(arg.split("=")[1])
+    elif arg.startswith("--region"):
+        region = arg.split("=")[1]
+    else:
+        usage()
+        sys.exit(1)
+
+client = boto3.client("cognito-idp", region)
 
 # Get a list of group names
 groups = []
@@ -47,9 +66,9 @@ next_page_token = None
 while has_next_page:
     try:
         response = (
-            client.list_groups(UserPoolId=user_pool_id, NextToken=next_page_token)
+            client.list_groups(UserPoolId=user_pool_id, Limit=page_size, NextToken=next_page_token)
             if next_page_token
-            else client.list_groups(UserPoolId=user_pool_id)
+            else client.list_groups(UserPoolId=user_pool_id, Limit=page_size)
         )
         groups.extend([group for group in response["Groups"]])
         next_page_token = response.get("NextToken")
@@ -73,9 +92,11 @@ for group in groups:
     while has_next_page:
         try:
             response = (
-                client.list_users_in_group(UserPoolId=user_pool_id, GroupName=group_name, NextToken=next_page_token)
+                client.list_users_in_group(
+                    UserPoolId=user_pool_id, GroupName=group_name, Limit=page_size, NextToken=next_page_token
+                )
                 if next_page_token
-                else client.list_users_in_group(UserPoolId=user_pool_id, GroupName=group_name)
+                else client.list_users_in_group(UserPoolId=user_pool_id, GroupName=group_name, Limit=page_size)
             )
             group["Users"].extend(response["Users"])
             next_page_token = response.get("NextToken")
