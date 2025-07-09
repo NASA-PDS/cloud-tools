@@ -5,7 +5,7 @@ from typing import Union
 
 import boto3
 
-import common
+from pds.cognito import common_cognito_defs
 
 
 # NOTE: The following attributes, while not required from an AWS point of view, must appear
@@ -28,12 +28,12 @@ mandatory_attrs: dict[str, Union[str, int]] = {}
 # Process the groups for the indicated cognito user pool
 
 if len(sys.argv) > 4 or len(sys.argv) < 2:
-    common.cognito_tool_usage(exit_status=1)
+    common_cognito_defs.cognito_tool_usage(exit_status=1)
 
 # Replace with your Cognito User Pool ID
 user_pool_id = sys.argv[1]
 
-page_size, region = common.get_args(sys.argv[2:], exit_status=1)
+page_size, region = common_cognito_defs.get_args(sys.argv[2:], exit_status=1)
 
 client = boto3.client("cognito-idp", region)
 
@@ -83,4 +83,4 @@ for group in groups:
             print(f"Error listing users for {user_pool_id}/{group_name}: {e}")
 
 user_pool = {"UserPoolId": f"{user_pool_id}", "Groups": groups}
-print(json.dumps(user_pool, indent=4, default=common.datetimeconverter))
+print(json.dumps(user_pool, indent=4, default=common_cognito_defs.datetimeconverter))

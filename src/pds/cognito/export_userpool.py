@@ -4,17 +4,17 @@ import sys
 
 import boto3
 
-import common
+from pds.cognito import common_cognito_defs
 
 
 # Process the cognito user pool
 
 if len(sys.argv) > 4 or len(sys.argv) < 2:
-    common.cognito_tool_usage(exit_status=1)
+    common_cognito_defs.cognito_tool_usage(exit_status=1)
 
 user_pool_id = sys.argv[1]
 
-page_size, region = common.get_args(sys.argv[2:], exit_status=1)
+page_size, region = common_cognito_defs.get_args(sys.argv[2:], exit_status=1)
 
 cognito_client = boto3.client("cognito-idp", region)
 
@@ -37,4 +37,4 @@ while has_next_page:
         has_next_page = False
 
 user_pool = {"UserPoolId": f"{user_pool_id}", "Users": users}
-print(json.dumps(user_pool, indent=4, default=common.datetimeconverter))
+print(json.dumps(user_pool, indent=4, default=common_cognito_defs.datetimeconverter))
