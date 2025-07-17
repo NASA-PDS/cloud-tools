@@ -23,10 +23,9 @@ def create_group(client, user_pool_id, group):
 # Populate the groups from the indicated json file, first checking that all groups exist.
 
 test_only = False
-if len(sys.argv) == 3:
-    if sys.argv[1] == "-n":
-        test_only = True
-        del sys.argv[1:2]
+if len(sys.argv) == 3 and sys.argv[1] == "-n":
+    test_only = True
+    del sys.argv[1:2]
 
 if len(sys.argv) != 2:
     print(f"Usage:\n\t{sys.argv[0]} {{-n}} <export_groups_json_file>")
