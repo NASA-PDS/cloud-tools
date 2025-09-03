@@ -1,6 +1,6 @@
 # Security Policy
 
-This document describes the security policy of My Project. (Please update this for your actual project.)
+This document describes the security policy of Planetary Data Cloud Tools.
 
 
 ## Supported Versions
@@ -9,11 +9,10 @@ Use this section to tell people about which versions of your project are current
 
 | Version | Supported |
 |:--------|:---------:|
-| 2.1.4   | ✅        |
-| 2.1.3   | ✅        |
-| <2.0    | ❌        |
+| 0.1.0   | ✅        |
+| <0.1.0  | ❌        |
 
 
 ## Reporting a Vulnerability
 
-To report a vulnerability, [please submit an issue on our tracker](https://github.com/NASA-PDS/<TODO: put project ID here>/issues/new?template=vulnerability-issue.md).
+To report a vulnerability, [please submit an issue on our tracker](https://github.com/NASA-PDS/cloud-tools/issues/new?template=vulnerability-issue.md).
