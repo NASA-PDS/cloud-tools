@@ -33,14 +33,15 @@ random_punct_set = '-.,*!?'
 random_character_set = string.ascii_letters + string.digits + random_punct_set
 def generate_random_string(length=8):
     """Generate a random string composed of alphanumeric + limited punctuation. Note
-       that minimum length is 3.
+       that minimum length is 4.
     """
-    # Ensure at least one character, one digit and one punctuation mark
-    random_string_list = [ random.choice(string.ascii_letters),
+    # Ensure at least one each upper and lower characters, one digit and one punctuation mark
+    random_string_list = [ random.choice(string.ascii_lowercase),
+                           random.choice(string.ascii_uppercase),
                            random.choice(string.digits),
                            random.choice(random_punct_set)
                          ]
-    if length > 3:
+    if length > 4:
         random_string_list = random_string_list + random.choices(random_character_set, k=length - 3)
     return ''.join(random_string_list)
 
