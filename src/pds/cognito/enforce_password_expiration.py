@@ -5,6 +5,8 @@ import json
 
 import boto3
 
+from common import send_mail, generate_random_string
+
 
 """
 This script accepts a user pool id, a period of days in which passwords are considered valid, and a period
@@ -28,6 +30,12 @@ to minutes (to more easily simulate account event states).
 # List of states which constitute an inactive user - Note that ARCHIVED is no longer used
 inactive_user_statuses = { 'RESET_REQUIRED', 'FORCE_CHANGE_PASSWORD', 'EXTERNAL_PROVIDER' }
 
+# List of User events which if result is passed, constitute a password change
+password_change_events = { 'PasswordChange', 'ForgotPassword' }
+
+# Temporary password length
+temporary_password_lenght = 8
+
 
 def datetime_serializable(obj):
     """Support JSON serializaion of datetimes"""
@@ -44,9 +52,9 @@ def get_userpool_users(client, user_pool_id):
     users = []
     while has_next_page: 
         response = (
-            client.list_users(UserPoolId=user_pool_id, AttributesToGet=[])
+            client.list_users(UserPoolId=user_pool_id)
             if next_token is None
-            else client.list_users(UserPoolId=user_pool_id, AttributesToGet=[], PaginationToken=next_token)
+            else client.list_users(UserPoolId=user_pool_id, PaginationToken=next_token)
         )
         users.extend(response['Users'])
 
@@ -62,6 +70,7 @@ def validate_user_creation(user_record, valid_datetime, warn_datetime):
     continue_on = False
     password_change_required = True
     issue_warning = False
+    last_event_date = None
 
     user_create_date = user_record['UserCreateDate'].replace(tzinfo=None)
     if user_create_date > valid_datetime:
@@ -70,8 +79,9 @@ def validate_user_creation(user_record, valid_datetime, warn_datetime):
     elif warn_datetime is not None and warn_datetime < user_create_date:
         print("User creation date preceeds warning datetime, warning required.")
         issue_warning = True
+        last_event_date = user_create_date
 
-    return password_change_required, issue_warning
+    return password_change_required, issue_warning, last_event_date
 
 
 def validate_user_password(client, user_pool_id, user_record, valid_datetime, warn_datetime):
@@ -83,20 +93,21 @@ def validate_user_password(client, user_pool_id, user_record, valid_datetime, wa
 
     password_change_required = False
     issue_warning = False
+    last_event_date = None
+    username = user_record['Username']
 
     if user_record['UserStatus'] in inactive_user_statuses:
-        print("User is not active, skipping.")
+        print(f"User {usename} is not active, skipping.")
     else:
         password_change_required = True
-        issue_warning = False
 
         continue_on = True
         next_token = None
         while continue_on:
             response = (
-                client.admin_list_user_auth_events(UserPoolId=user_pool_id, Username=user_name) 
+                client.admin_list_user_auth_events(UserPoolId=user_pool_id, Username=username) 
                 if next_token is None
-                else client.admin_list_user_auth_events(UserPoolId=user_pool_id, Username=user_name, NextToken=next_token)   
+                else client.admin_list_user_auth_events(UserPoolId=user_pool_id, Username=username, NextToken=next_token)   
             )
     
             authEvents = response.get('AuthEvents')
@@ -107,63 +118,113 @@ def validate_user_password(client, user_pool_id, user_record, valid_datetime, wa
                     print("Change password not identified within validity period, password change required.")
                     continue_on = False
                     break
-                elif user_event['EventType'] == 'PasswordChange' and user_event['EventResponse'] == 'Pass':
-                    print("Password change has been found within validity period.")
+                elif user_event['EventType'] in password_change_events and user_event['EventResponse'] == 'Pass':
+                    print("An event constituting a password change has been found within validity period.")
                     continue_on = False
                     password_change_required = False
                     if warn_datetime is not None and event_datetime < warn_datetime:
                         print("Password change is within warning period, warning required.")
                         issue_warning = True
+                        last_event_date = event_datetime
                     break
             
             next_token = response.get('NextToken')
             if continue_on and next_token is None:
                 print("User has no auth event history before validity window - checking user creation.")
-                password_change_required, issue_warning = validate_user_creation(user_record, valid_datetime, warn_datetime)
+                password_change_required, issue_warning, last_event_date = validate_user_creation(user_record, valid_datetime, warn_datetime)
                 continue_on = False
 
-    return password_change_required, issue_warning
+    return password_change_required, issue_warning, last_event_date
 
 
-user_pool_id = sys.argv[1]
-valid_days = int(sys.argv[2])
-warn_window_days = int(sys.argv[3])
+def extract_user_email(user):
+    """ 
+    Extract email address from the user record, accommodating that it could be optional and unable to be specified
+    in the AttributesToGet argument to boto3.list_users() 
+    """
+    result = None
+    for attr in user["Attributes"]:
+        if attr["Name"] == "email":
+            result = attr["Value"]
+    return result
 
-apply_changes = False
-develop = False
-for i in range(4, len(sys.argv)):
-    if sys.argv[i] == '--dev':
-        # dev purposes, shifts units for validity and warning to minutes
-        develop = True
-    elif sys.argv[i] == '--apply':
-        # make changes
-        apply_changes = True
 
-# datetime at which passwords expire from now
-valid_time_diff = timedelta(days=valid_days)
-if develop: valid_time_diff = timedelta(minutes=valid_days)
-valid_datetime = datetime.now() - valid_time_diff
+def password_expiration_check(user_pool_id, valid_period, warn_window, 
+                              smtp_endpoint, sender, 
+                              expired_message_template, expired_subject_template, 
+                              warning_message_template, warning_subject_template, 
+                              apply_changes=True, develop_mode=False):
+    """Run through the given pool to handle expired passwords and issue warnings as necessary."""
+    current_date = datetime.now()
+    # datetime at which passwords expire from now
+    valid_time_diff = timedelta(days=valid_period)
+    if develop_mode: valid_time_diff = timedelta(minutes=valid_period)
+    valid_datetime = current_date - valid_time_diff
  
-# datetime at which imminent password expiration warnings are issued
-warn_time_diff = timedelta(days=warn_window_days)
-if develop: warn_time_diff = timedelta(minutes=warn_window_days)
-warn_datetime = valid_datetime + warn_time_diff
+    # datetime at which imminent password expiration warnings are issued
+    warn_time_diff = timedelta(days=warn_window)
+    if develop_mode: warn_time_diff = timedelta(minutes=warn_window)
+    warn_datetime = valid_datetime + warn_time_diff
 
-print(f"Password expiration datetime {valid_datetime}")
-print(f"Password warning datetime {warn_datetime}")
+    print(f"Password expiration datetime {valid_datetime}")
+    print(f"Password warning datetime {warn_datetime}")
 
-client = boto3.client("cognito-idp")
+    client = boto3.client("cognito-idp")
 
-users = get_userpool_users(client, user_pool_id)
-for user in users:
-    user_name = user['Username']
-    password_change_required, issue_warning = validate_user_password(client, user_pool_id, user, valid_datetime, warn_datetime)
+    print(client.describe_user_pool(UserPoolId=user_pool_id))
+    message_data = { 
+        "user_pool_name" : client.describe_user_pool(UserPoolId=user_pool_id)["UserPool"]["Name"],
+        "user_pool_id" : user_pool_id,
+        "valid_date" : valid_datetime.strftime("%Y/%m/%d"),
+        "warn_date" : warn_datetime.strftime("%Y/%m/%d"),
+        "valid_period" : valid_period,
+        "warn_window" : warn_window
+    }
 
-    if password_change_required:
-        print(f"Hey {user_name}, resetting your password. I SAY, YOUR PASSWORD IS WILL BE RESET.")
-        if apply_changes:
-            # force a password change, this will automatically send out a notification message
-            client.admin_reset_user_password(user_pool_id, user_name)
-    elif issue_warning:
-        # send out a message indicating that the user's password is about to expire
-        print(f"Hey {user_name}, your password is about to expire. I SAY, IT'S ABOUT TO EXPIRE.")
+    users = get_userpool_users(client, user_pool_id)
+    for user in users:
+        username = user['Username']
+        user_email = extract_user_email(user)
+        if user_email is None:
+            print("WARNING: {username} does not have an assigned email address in user pool {user_pool_id}/{user_pool_name}. Skipping.")
+            continue
+
+        password_change_required, issue_warning, last_event_date = validate_user_password(client, user_pool_id, user, valid_datetime, warn_datetime)
+
+        if develop_mode:
+            print(f"User : {username}")
+        
+        if last_event_date is not None:
+            # calculate actual expiration date based on last qualifying event
+            actual_expire_date = last_event_date + timedelta(days=valid_period) 
+            message_data["expiration_date"] = actual_expire_date.strftime("%D")
+        else:
+            message_data["expiration_date"] = "N/A"
+        message_data["username"] = username
+        message_data["user_email"] = user_email
+        if password_change_required:
+            temp_password = generate_random_string(temporary_password_length)
+            message_data["temp_password"] = temp_password
+            expired_message = expired_message_template.format(**message_data)
+            expired_subject = expired_subject_template.format(**message_data)
+            if develop_mode:
+                print(expired_message)
+            if smtp_endpoint is not None:
+                send_mail(smtp_endpoint, sender, user_email, expired_subject, expired_message)
+            if apply_changes:
+                """ 
+                  Force a password change, this will automatically send out a notification message.
+                  admin_set_user_password is used because it is functionally cleaner. The alternative of
+                  admin_reset_user_password requires construction of a web-app that performs the 
+                  confirm_user_password portion of that process.
+                """
+                # client.admin_reset_user_password(UserPoolId=user_pool_id, Username=username)
+                client.admin_set_user_password(UserPoolId=user_pool_id, Username=username, Password=temp_password, Permanent=False)
+        elif issue_warning:
+            # send out a message indicating that the user's password is about to expire
+            warning_message = warning_message_template.format(**message_data)
+            warning_subject = warning_subject_template.format(**message_data)
+            if develop_mode:
+               print(warning_message)
+            if smtp_endpoint is not None:
+                send_mail(smtp_endpoint, sender, user_email, warning_subject, warning_message)
