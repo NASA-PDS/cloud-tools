@@ -110,7 +110,7 @@ resource "aws_scheduler_schedule" "invoke_lambda_schedule" {
   }
 }
 
-resource "aws_ssm_parameter" "" {
+resource "aws_ssm_parameter" "user_pool_id" {
   name      = "${var.ssm_key_path}/user_pool_id" 
   type      = "String"
   value     = var.user_pool_id
@@ -210,6 +210,70 @@ resource "aws_ssm_parameter" "smtp_sender" {
   name      = "${var.ssm_key_path}/smtp_sender"
   type      = "String"
   value     = var.smtp_sender
+  overwrite = true
+
+  tags = {
+    Name = var.lambda_function_name
+    Node = var.tag_node_value
+    Venue = var.tag_venue_value
+    Project = "PDS"
+    Service = "SSM"
+    CreatedBy = var.tag_createdby_value
+  }
+}
+
+resource "aws_ssm_parameter" "expired_message_template" {
+  name      = "${var.ssm_key_path}/expired_message_template"
+  type      = "String"
+  value     = var.expired_message_template
+  overwrite = true
+
+  tags = {
+    Name = var.lambda_function_name
+    Node = var.tag_node_value
+    Venue = var.tag_venue_value
+    Project = "PDS"
+    Service = "SSM"
+    CreatedBy = var.tag_createdby_value
+  }
+}
+
+resource "aws_ssm_parameter" "expired_subject_template" {
+  name      = "${var.ssm_key_path}/expired_subject_template"
+  type      = "String"
+  value     = var.expired_subject_template
+  overwrite = true
+
+  tags = {
+    Name = var.lambda_function_name
+    Node = var.tag_node_value
+    Venue = var.tag_venue_value
+    Project = "PDS"
+    Service = "SSM"
+    CreatedBy = var.tag_createdby_value
+  }
+}
+
+resource "aws_ssm_parameter" "warning_message_template" {
+  name      = "${var.ssm_key_path}/warning_message_template"
+  type      = "String"
+  value     = var.warning_message_template
+  overwrite = true
+
+  tags = {
+    Name = var.lambda_function_name
+    Node = var.tag_node_value
+    Venue = var.tag_venue_value
+    Project = "PDS"
+    Service = "SSM"
+    CreatedBy = var.tag_createdby_value
+  }
+}
+
+resource "aws_ssm_parameter" "warning_subject_template" {
+  name      = "${var.ssm_key_path}/warning_subject_template"
+  type      = "String"
+  value     = var.warning_subject_template
   overwrite = true
 
   tags = {

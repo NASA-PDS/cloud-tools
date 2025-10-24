@@ -90,6 +90,42 @@ variable "smtp_sender" {
   description = "The effective email address for outgoing messages"
 }
 
+# for the templates below, the following format variables are supported: 
+#  - username : the name of the user as registered in the user pool
+#  - user_email : the user's registered email address
+#  - user_pool_name : the name of the pool to which the user belongs
+#  - user_pool_id : the ID of the pool to which the user belongs
+#  - valid_date : the date at which the user password expire (current date - valid_period)
+#  - expiration_date : the data at which the user's password expired ("N/A" if it has not expired)
+#  - warn_date : the date at which the warnings regarding the user's password expiring are issued
+#  - valid_period : the period in days of which a user's password remains valid
+#  - warn_window : the period in days prior to expiration at which warnings are sent
+#  - temp_password : if the password has expired, the temporary password generated for the user
+
+variable "expired_message_template" {
+  type        = string
+  description = "Template (in python string.format form) for email message to send when a user's password has expired"
+  default     = "The password for your PDS Cognito user {username} has expired and a temporary one: {temp_password} has been assigned. Please access the login URL in order to change your password."
+}
+
+variable "expired_subject_template" {
+  type        = string
+  description = "Template (in python string.format form) of subject line for email message to send when a user's password has expired"
+  default     = "PDS Cognito User Password for {username} has Expired"
+}
+
+variable "warning_message_template" {
+  type        = string
+  description = "Template (in python string.format form) for email message to send when a user's password is about to expire"
+  default     = "The password for your PDS Cognito user {username} will expire on {expiration_date} after which you will forced to change it. Please access 'forgot password' link at the login URL in order to change and reset your passworda."
+}
+
+variable "warning_subject_template" {
+  type        = string
+  description = "Template (in python string.format form) of subject line for email message to send when a user's password is about to expire"
+  default     = "PDS Cognito User Password expiration for {username} is approaching"
+}
+
 variable "tag_node_value" {
   description = "The value for the Node tag"
   type        = string
@@ -108,7 +144,7 @@ variable "tag_createdby_value" {
   default     = "pds_operations@jpl.nasa.gov"
 }
 
-# These should be used only for dev/debugging. If not defined, they default to True and False, respectively
+# These should be used only for dev/debugging. If not defined, they default to True and False, respectively. See descriptions for their effects.
 # variable "apply_changes" {
 #   type        = string
 #   description = "Optionally deactivate making changes to the state of the users and send email"
