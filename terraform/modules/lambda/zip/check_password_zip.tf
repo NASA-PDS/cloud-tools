@@ -23,7 +23,6 @@ data "aws_caller_identity" "current" {}
 # Deploy the zips to S3
 module "lambda_bucket" {
   source        = "git::https://github.com/NASA-PDS/pds-tf-modules.git//terraform/modules/s3/bucket"  # pragma: allowlist secret
-  # source        = "/Users/jdyoung/workspace/pds/pds-tf-modules/terraform/modules/s3/bucket"  # pragma: allowlist secret
   bucket_name   = var.lambda_s3_bucket_name
   partition     = var.lambda_s3_bucket_partition
   bucket_policy = <<POLICY
@@ -73,7 +72,6 @@ module "lambda_bucket" {
 
 module "lambda_s3_object" {
   source        = "git::https://github.com/NASA-PDS/pds-tf-modules.git//terraform/modules/s3/object"  # pragma: allowlist secret
-  # source      = "/Users/jdyoung/workspace/pds/pds-tf-modules/terraform/modules/s3/object"  # pragma: allowlist secret
   bucket      = module.lambda_bucket.bucket_id
   key         = "${var.zip_file_name}"
   source_path = data.archive_file.lambda_check_password.output_path
