@@ -14,7 +14,8 @@ def lambda_handler(event, context):
     # Pull config values from SSM parameter store. This utilizes the ssm model from Scott Collins' excellent work on the data upload manager
     config_ssm_path = event["config_ssm_path"]
 
-    expected_fields = ("user_pool_id", "valid_period", "warn_window", "smtp_username", "smtp_password", "smtp_server", "smtp_sender", 
+    expected_fields = ("user_pool_id", "cognito_login_url", "valid_period", "warn_window", 
+                       "smtp_username", "smtp_password", "smtp_server", "smtp_sender", 
                        "expired_message_template", "expired_subject_template", "warning_message_template", "warning_subject_template")
     # optional_fields are ("apply_changes", "develop_mode")
 
@@ -31,6 +32,7 @@ def lambda_handler(event, context):
         )
 
     user_pool_id = config_params["user_pool_id"]
+    cognito_login_url = config_params["cognito_login_url"]
     valid_period = int(config_params["valid_period"])
     warn_window = int(config_params["warn_window"])
     smtp_username = config_params["smtp_username"]
@@ -55,7 +57,7 @@ def lambda_handler(event, context):
         smtp_endpoint = open_smtp(smtp_username, smtp_password, smtp_host, int(smtp_port))
 
     try:
-        password_expiration_check(user_pool_id, valid_period, warn_window, 
+        password_expiration_check(user_pool_id, cognito_login_url, valid_period, warn_window, 
                                   smtp_endpoint, sender, 
                                   expired_message_template, expired_subject_template,
                                   warning_message_template, warning_subject_template,

@@ -34,7 +34,7 @@ inactive_user_statuses = { 'RESET_REQUIRED', 'FORCE_CHANGE_PASSWORD', 'EXTERNAL_
 password_change_events = { 'PasswordChange', 'ForgotPassword' }
 
 # Temporary password length
-temporary_password_lenght = 8
+temporary_password_length = 8
 
 
 def datetime_serializable(obj):
@@ -149,7 +149,7 @@ def extract_user_email(user):
     return result
 
 
-def password_expiration_check(user_pool_id, valid_period, warn_window, 
+def password_expiration_check(user_pool_id, cognito_login_url, valid_period, warn_window, 
                               smtp_endpoint, sender, 
                               expired_message_template, expired_subject_template, 
                               warning_message_template, warning_subject_template, 
@@ -171,23 +171,28 @@ def password_expiration_check(user_pool_id, valid_period, warn_window,
 
     client = boto3.client("cognito-idp")
 
-    print(client.describe_user_pool(UserPoolId=user_pool_id))
+    user_pool_info = client.describe_user_pool(UserPoolId=user_pool_id) 
+    if develop_mode: print(user_pool_info)
+
+    user_pool = user_pool_info.get("UserPool", {})
+    user_pool_name = user_pool.get("Name", "Undefined")
+    temp_password_validity_days = user_pool.get("Policies", {}).get("PasswordPolicy", {}).get("TemporaryPasswordValidityDays")
+
     message_data = { 
-        "user_pool_name" : client.describe_user_pool(UserPoolId=user_pool_id)["UserPool"]["Name"],
+        "user_pool_name" : user_pool_name,
         "user_pool_id" : user_pool_id,
+        "cognito_login_url" : cognito_login_url,
         "valid_date" : valid_datetime.strftime("%Y/%m/%d"),
         "warn_date" : warn_datetime.strftime("%Y/%m/%d"),
         "valid_period" : valid_period,
-        "warn_window" : warn_window
+        "warn_window" : warn_window,
+        "temp_password_validity_days" : temp_password_validity_days
     }
 
     users = get_userpool_users(client, user_pool_id)
     for user in users:
         username = user['Username']
         user_email = extract_user_email(user)
-        if user_email is None:
-            print("WARNING: {username} does not have an assigned email address in user pool {user_pool_id}/{user_pool_name}. Skipping.")
-            continue
 
         password_change_required, issue_warning, last_event_date = validate_user_password(client, user_pool_id, user, valid_datetime, warn_datetime)
 
@@ -209,16 +214,17 @@ def password_expiration_check(user_pool_id, valid_period, warn_window,
             expired_subject = expired_subject_template.format(**message_data)
             if develop_mode:
                 print(expired_message)
-            if smtp_endpoint is not None:
+            if user_email is None:
+                print("WARNING: {username} does not have an assigned email address in user pool {user_pool_id}/{user_pool_name}. Account password has been reset but an email message will not be sent.")
+            elif smtp_endpoint is not None:
                 send_mail(smtp_endpoint, sender, user_email, expired_subject, expired_message)
             if apply_changes:
                 """ 
-                  Force a password change, this will automatically send out a notification message.
+                  Change the user password.
                   admin_set_user_password is used because it is functionally cleaner. The alternative of
                   admin_reset_user_password requires construction of a web-app that performs the 
                   confirm_user_password portion of that process.
                 """
-                # client.admin_reset_user_password(UserPoolId=user_pool_id, Username=username)
                 client.admin_set_user_password(UserPoolId=user_pool_id, Username=username, Password=temp_password, Permanent=False)
         elif issue_warning:
             # send out a message indicating that the user's password is about to expire
@@ -226,5 +232,7 @@ def password_expiration_check(user_pool_id, valid_period, warn_window,
             warning_subject = warning_subject_template.format(**message_data)
             if develop_mode:
                print(warning_message)
-            if smtp_endpoint is not None:
+            if user_email is None:
+                print("WARNING: {username} does not have an assigned email address in user pool {user_pool_id}/{user_pool_name}. A password expiration imminent warning email message will not be sent.")
+            elif smtp_endpoint is not None:
                 send_mail(smtp_endpoint, sender, user_email, warning_subject, warning_message)
