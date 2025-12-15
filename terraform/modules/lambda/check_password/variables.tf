@@ -1,3 +1,8 @@
+variable "aws_region" {
+  type        = string
+  description = "AWS Region"
+  default     = "us-west-2"
+}
 
 variable "ssm_key_path" {
   type        = string
@@ -7,12 +12,18 @@ variable "ssm_key_path" {
 variable "project" {
   type        = string
   description = "Project name"
+  default = "pds-en"
 }
 
 variable "cicd" {
   type        = string
   description = "CI/CD environment name"
   default     = "pds-github"
+}
+
+variable "zip_file_name" {
+  type        = string
+  description = "Name of the archive zip file to use as the lambda source."
 }
 
 variable "lambda_s3_bucket_name" {
@@ -27,7 +38,7 @@ variable "lambda_s3_bucket_partition" {
 
 variable "lambda_function_name" {
   type        = string
-  default     = "check_password_lambda"
+  default     = "pds_check_password_lambda"
   description = "Name to assign to the password checker Lambda"
 }
 
@@ -39,7 +50,7 @@ variable "lambda_function_description" {
 
 variable "lambda_iam_role_arn" {
   type        = string
-  description = "IAM role ARN to allocate to the Lambda function"
+  description = "IAM role ARN to allocate to the Lambda function. Also used as the scheduler target execution role."
 }
 
 variable "scheduler_schedule_expression" {
@@ -49,14 +60,17 @@ variable "scheduler_schedule_expression" {
   default     = "cron(00 00 ? * * *)"
 }
 
-variable "scheduler_iam_role_arn" {
-  type        = string
-  description = "ARN of the IAM role to use for EventBridge scheduled execution"
-}
-
 variable "user_pool_id" {
   type        = string
   description = "ID of the user pool for which passwords are to be checked/validated"
+}
+
+# Note that this can be programmatically generated but there are just so many options
+# as far as client, client scopes, auth flows, domain types it's simplest just to
+# specify the whole thing as a single value to reduce code complexity.
+variable "cognito_login_url" {
+  type        = string
+  description = "Full URL of the cognito login page for this user pool, domain and client"
 }
 
 variable "valid_period" {
@@ -101,11 +115,12 @@ variable "smtp_sender" {
 #  - valid_period : the period in days of which a user's password remains valid
 #  - warn_window : the period in days prior to expiration at which warnings are sent
 #  - temp_password : if the password has expired, the temporary password generated for the user
+#  - temp_password_validity_days : the # of days the temporary password remains valid
 
 variable "expired_message_template" {
   type        = string
   description = "Template (in python string.format form) for email message to send when a user's password has expired"
-  default     = "The password for your PDS Cognito user {username} has expired and a temporary one: {temp_password} has been assigned. Please access the login URL in order to change your password."
+  default     = "The password for your PDS Cognito user {username} has expired and a temporary one: {temp_password} has been assigned. Please access the login URL in order to change your password. This temporary password will remain valid for {temp_password_validity_days} days."
 }
 
 variable "expired_subject_template" {
@@ -145,14 +160,14 @@ variable "tag_createdby_value" {
 }
 
 # These should be used only for dev/debugging. If not defined, they default to True and False, respectively. See descriptions for their effects.
-# variable "apply_changes" {
-#   type        = string
-#   description = "Optionally deactivate making changes to the state of the users and send email"
-#   default     = "True"
-# }
+variable "apply_changes" {
+  type        = string
+  description = "Optionally deactivate making changes to the state of the users and send email"
+  default     = "True"
+}
 
-# variable "develop_mode" {
-#   type        = string
-#   description = "Optionally active develop mode which considers valid_period and warn window as MINUTES, not days."
-#   default     = "False"
-# }
+variable "develop_mode" {
+  type        = string
+  description = "Optionally active develop mode which considers valid_period and warn window as MINUTES, not days."
+  default     = "False"
+}
