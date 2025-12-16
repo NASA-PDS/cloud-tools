@@ -1,8 +1,8 @@
 # Terraform module for the AWS Cognito Password Checker
 terraform {
   backend "s3" {
-    bucket = "pds-prod-cognito-lambda"
-    key    = "terraform/check_password.tfstate"
+    bucket = "pds-prod-infra"
+    key    = "dum_cognito/lambda/check_passwor_lambda.tfstate"
     region = "us-west-2"
   }
 }
