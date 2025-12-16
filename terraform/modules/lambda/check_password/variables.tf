@@ -60,6 +60,13 @@ variable "scheduler_schedule_expression" {
   default     = "cron(00 00 ? * * *)"
 }
 
+variable "schedule_schedule_expression_timezone" {
+  type        = string
+  description = "Timezone of the schedule expression"
+  # Default to Pacific time for easier understanding. Sorry, Sean Kelly...
+  default     = "America/Los Angeles"
+}
+
 variable "user_pool_id" {
   type        = string
   description = "ID of the user pool for which passwords are to be checked/validated"

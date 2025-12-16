@@ -52,6 +52,7 @@ resource "aws_scheduler_schedule" "invoke_lambda_schedule" {
     mode = "OFF"
   }
   schedule_expression = var.scheduler_schedule_expression
+  schedule_expression_timezone = var.scheduler_schedule_expression_timezone
   target {
     arn = aws_lambda_function.lambda_check_password.arn
     role_arn = var.lambda_iam_role_arn
