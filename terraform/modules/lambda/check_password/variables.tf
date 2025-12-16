@@ -60,7 +60,7 @@ variable "scheduler_schedule_expression" {
   default     = "cron(00 00 ? * * *)"
 }
 
-variable "schedule_schedule_expression_timezone" {
+variable "scheduler_schedule_expression_timezone" {
   type        = string
   description = "Timezone of the schedule expression"
   # Default to Pacific time for easier understanding. Sorry, Sean Kelly...
