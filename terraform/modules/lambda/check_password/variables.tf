@@ -64,7 +64,7 @@ variable "scheduler_schedule_expression_timezone" {
   type        = string
   description = "Timezone of the schedule expression"
   # Default to Pacific time for easier understanding. Sorry, Sean Kelly...
-  default     = "America/Los Angeles"
+  default     = "America/Los_Angeles"
 }
 
 variable "user_pool_id" {
