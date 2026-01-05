@@ -97,7 +97,7 @@ def validate_user_password(client, user_pool_id, user_record, valid_datetime, wa
     username = user_record['Username']
 
     if user_record['UserStatus'] in inactive_user_statuses:
-        print(f"User {usename} is not active, skipping.")
+        print(f"User {username} is not active, skipping.")
     else:
         password_change_required = True
 
