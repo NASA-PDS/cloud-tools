@@ -10,8 +10,11 @@ from enforce_password_expiration import password_expiration_check
 
 
 def lambda_handler(event, context):
-    """Lambda handler function."""
-    # Pull config values from SSM parameter store. This utilizes the ssm model from Scott Collins' excellent work on the data upload manager
+    """Lambda handler function.
+
+    Pull config values from SSM parameter store. This utilizes the ssm model from Scott Collins' excellent work
+    on the data upload manager.
+    """
     config_ssm_path = event["config_ssm_path"]
 
     expected_fields = (

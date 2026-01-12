@@ -238,7 +238,9 @@ def password_expiration_check(
                 print(expired_message)
             if user_email is None:
                 print(
-                    "WARNING: {username} does not have an assigned email address in user pool {user_pool_id}/{user_pool_name}. Account password has been reset but an email message will not be sent."
+                    f"WARNING: {username} does not have an assigned email address in user pool "
+                    f"{user_pool_id}/{user_pool_name}. Account password has been reset but an email "
+                    "message will not be sent."
                 )
             elif smtp_endpoint is not None:
                 send_mail(smtp_endpoint, sender, user_email, expired_subject, expired_message)
@@ -260,7 +262,9 @@ def password_expiration_check(
                 print(warning_message)
             if user_email is None:
                 print(
-                    "WARNING: {username} does not have an assigned email address in user pool {user_pool_id}/{user_pool_name}. A password expiration imminent warning email message will not be sent."
+                    f"WARNING: {username} does not have an assigned email address in user pool "
+                    f"{user_pool_id}/{user_pool_name}. A password expiration imminent warning email "
+                    "message will not be sent."
                 )
             elif smtp_endpoint is not None:
                 send_mail(smtp_endpoint, sender, user_email, warning_subject, warning_message)
