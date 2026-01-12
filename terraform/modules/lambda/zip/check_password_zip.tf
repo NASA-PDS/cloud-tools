@@ -67,7 +67,7 @@ data "aws_caller_identity" "current" {}
   # POLICY
   # enable_blocks = false
   # enable_policy = true
-# 
+  #
   # required_tags = {
     # project = var.project
     # cicd    = var.cicd
@@ -83,7 +83,7 @@ module "lambda_s3_object" {
   source        = "git::https://github.com/NASA-PDS/pds-tf-modules.git//terraform/modules/s3/object"  # pragma: allowlist secret
   # Uncomment this out if using a new bucket
   # bucket      = module.lambda_bucket.bucket_id
-  
+
   # Comment this out if using a new bucket
   bucket      = data.aws_s3_bucket.lambda_bucket.id
   key         = "${var.zip_file_name}"

@@ -111,7 +111,7 @@ variable "smtp_sender" {
   description = "The effective email address for outgoing messages"
 }
 
-# for the templates below, the following format variables are supported: 
+# for the templates below, the following format variables are supported:
 #  - username : the name of the user as registered in the user pool
 #  - user_email : the user's registered email address
 #  - user_pool_name : the name of the pool to which the user belongs

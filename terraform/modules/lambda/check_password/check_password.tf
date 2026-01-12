@@ -61,7 +61,7 @@ resource "aws_scheduler_schedule" "invoke_lambda_schedule" {
 }
 
 resource "aws_ssm_parameter" "user_pool_id" {
-  name      = "${var.ssm_key_path}/user_pool_id" 
+  name      = "${var.ssm_key_path}/user_pool_id"
   type      = "String"
   value     = var.user_pool_id
 
@@ -76,7 +76,7 @@ resource "aws_ssm_parameter" "user_pool_id" {
 }
 
 resource "aws_ssm_parameter" "cognito_login_url" {
-  name      = "${var.ssm_key_path}/cognito_login_url" 
+  name      = "${var.ssm_key_path}/cognito_login_url"
   type      = "String"
   value     = var.cognito_login_url
 

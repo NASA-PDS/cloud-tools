@@ -1,4 +1,5 @@
 """Extract the list of users from the identified Cognito user pool."""
+
 import json
 import sys
 
