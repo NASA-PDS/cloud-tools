@@ -1,22 +1,33 @@
 """Lambda interface to initiate password expiration checking."""
-import sys
-import os
-import json
-import boto3
 
-from common import open_smtp, close_smtp, get_ssm_parameters_by_path
+import json
+import sys
+
+from common import close_smtp
+from common import get_ssm_parameters_by_path
+from common import open_smtp
 from enforce_password_expiration import password_expiration_check
 
 
 def lambda_handler(event, context):
-    """Lambda handler function"""
-    
+    """Lambda handler function."""
     # Pull config values from SSM parameter store. This utilizes the ssm model from Scott Collins' excellent work on the data upload manager
     config_ssm_path = event["config_ssm_path"]
 
-    expected_fields = ("user_pool_id", "cognito_login_url", "valid_period", "warn_window", 
-                       "smtp_username", "smtp_password", "smtp_server", "smtp_sender", 
-                       "expired_message_template", "expired_subject_template", "warning_message_template", "warning_subject_template")
+    expected_fields = (
+        "user_pool_id",
+        "cognito_login_url",
+        "valid_period",
+        "warn_window",
+        "smtp_username",
+        "smtp_password",
+        "smtp_server",
+        "smtp_sender",
+        "expired_message_template",
+        "expired_subject_template",
+        "warning_message_template",
+        "warning_subject_template",
+    )
     # optional_fields are ("apply_changes", "develop_mode")
 
     ssm_parameters = get_ssm_parameters_by_path(config_ssm_path)
@@ -57,15 +68,24 @@ def lambda_handler(event, context):
         smtp_endpoint = open_smtp(smtp_username, smtp_password, smtp_host, int(smtp_port))
 
     try:
-        password_expiration_check(user_pool_id, cognito_login_url, valid_period, warn_window, 
-                                  smtp_endpoint, sender, 
-                                  expired_message_template, expired_subject_template,
-                                  warning_message_template, warning_subject_template,
-                                  apply_changes, develop_mode)
+        password_expiration_check(
+            user_pool_id,
+            cognito_login_url,
+            valid_period,
+            warn_window,
+            smtp_endpoint,
+            sender,
+            expired_message_template,
+            expired_subject_template,
+            warning_message_template,
+            warning_subject_template,
+            apply_changes,
+            develop_mode,
+        )
     finally:
         if smtp_endpoint is not None:
             close_smtp(smtp_endpoint)
-    
+
 
 """For testing"""
 if __name__ == "__main__":
@@ -73,6 +93,6 @@ if __name__ == "__main__":
         print(f"Usage:\n\t{sys.argv[0]} <ssm_path>")
         sys.exit(0)
 
-    event = { "config_ssm_path" : sys.argv[1] }
+    event = {"config_ssm_path": sys.argv[1]}
 
     lambda_handler(event, None)

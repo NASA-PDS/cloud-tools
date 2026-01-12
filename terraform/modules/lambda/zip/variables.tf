@@ -46,5 +46,5 @@ variable "tag_venue_value" {
 variable "tag_createdby_value" {
   description = "The value for the CreatedBy tag"
   type        = string
-  default     = "pds_operations@jpl.nasa.gov"
+  default     = "pds_operations@jpl.nasa.gov" # pragma: allowlist-secret
 }
