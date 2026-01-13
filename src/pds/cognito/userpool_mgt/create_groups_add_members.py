@@ -1,5 +1,4 @@
 """Using a json file produced by export_groups.py, populate the groups w/ the indicated users."""
-
 import json
 import sys
 
