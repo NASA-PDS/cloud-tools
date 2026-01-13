@@ -3,10 +3,10 @@
 import json
 import sys
 
-from common import close_smtp  # type: ignore[import-not-found]
-from common import get_ssm_parameters_by_path  # type: ignore[import-not-found]
-from common import open_smtp  # type: ignore[import-not-found]
-from enforce_password_expiration import password_expiration_check  # type: ignore[import-not-found]
+from common import close_smtp  # type: ignore[import]
+from common import get_ssm_parameters_by_path  # type: ignore[import]
+from common import open_smtp  # type: ignore[import]
+from enforce_password_expiration import password_expiration_check  # type: ignore[import]
 
 
 def lambda_handler(event, context):

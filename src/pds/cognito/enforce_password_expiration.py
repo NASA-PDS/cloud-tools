@@ -5,8 +5,8 @@ from datetime import datetime
 from datetime import timedelta
 
 import boto3
-from common import generate_random_string  # type: ignore[import-not-found]
-from common import send_mail  # type: ignore[import-not-found]
+from common import generate_random_string  # type: ignore[import]
+from common import send_mail  # type: ignore[import]
 
 
 """
