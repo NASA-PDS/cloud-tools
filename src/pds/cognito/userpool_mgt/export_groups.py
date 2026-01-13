@@ -1,5 +1,4 @@
 """Extract the user groups and members from the identified Cognito user pool."""
-
 import json
 import sys
 from typing import Union

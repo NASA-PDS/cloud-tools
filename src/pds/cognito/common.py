@@ -1,5 +1,4 @@
 """Common functions."""
-
 import datetime
 import random
 import smtplib

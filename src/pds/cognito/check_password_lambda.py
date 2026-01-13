@@ -1,5 +1,4 @@
 """Lambda interface to initiate password expiration checking."""
-
 import json
 import sys
 
