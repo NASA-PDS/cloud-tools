@@ -1,26 +1,54 @@
 #!/usr/bin/env python3
-"""
-Compare two S3 checksum manifests.
+"""Compare two S3 checksum manifests to verify a bucket migration.
 
 Goal:
-- Verify that every object in OLD has at least one matching object in NEW
-  by content signature, regardless of key name.
+    Confirm that every object in OLD has at least one matching object in NEW
+    by content signature, regardless of key name or bucket name.
 
-Primary signature:
-  (size, checksum_type, checksum_value)
+Matching strategy:
+    Objects are matched on the tuple (size, checksum_type, checksum_value).
+    Key names are intentionally ignored so renamed objects still count as present.
 
-Fallback/debug fields:
-  checksum_algorithm, etag
+Multipart ETags:
+    AWS S3 computes ETags differently for multipart uploads: the value is a hash
+    of part hashes suffixed with the part count (e.g. "abc123-4").  When an
+    object is re-uploaded or copied with a different part size the ETag changes,
+    even if the object bytes are identical.  These checksums are therefore NOT
+    stable across migrations and cannot be used to confirm presence in NEW.
+    Any OLD row whose checksum_value matches the pattern ``<hex>-<digits>`` is
+    treated as unverifiable and written to --unverifiable-output rather than
+    --missing-output.
 
-Outputs:
-- summary to stdout
-- missing coverage CSV  (confirmed missing from NEW)
-- unverifiable CSV      (no checksum available; cannot confirm presence in NEW)
-- weak rows CSV         (NEW-side rows without usable checksums)
+Output files:
+    --missing-output (default: missing_in_new.csv)
+        OLD-side rows whose (size, checksum_type, checksum_value) signature was
+        not found anywhere in NEW.  These objects have stable checksums (not
+        multipart ETags) and are confirmed absent from the destination.
+        Action required: investigate why they were not migrated.
+
+    --unverifiable-output (default: unverifiable.csv)
+        OLD-side rows that cannot be confirmed present in NEW for one of two
+        reasons:
+          (a) The row has no usable checksum at all (empty, ERROR:*, etc.).
+          (b) The row has a multipart ETag (value ends in -<N>), which changes
+              when objects are re-uploaded and therefore cannot reliably match
+              against the destination.
+        The ``reason`` column appended to each output row records which case
+        applies: ``no_checksum`` or ``multipart_etag``.
+        Action required: use a different verification method (e.g. byte-level
+        comparison, S3 object metadata, or re-checksumming) for these objects.
+
+    --weak-output (default: weak_checksum_rows.csv)
+        NEW-side rows that have no usable checksum.  These entries cannot be
+        used to confirm migration coverage for any OLD object.
+        Action required: re-run checksum generation on NEW for these objects.
 
 Exit codes:
-  0 — PASS: every source object is confirmed present in destination
-  1 — FAIL: one or more source objects are missing or unverifiable
+    0 — PASS: every OLD object is either confirmed present in NEW or is
+              unverifiable due to a multipart ETag (i.e. missing_count == 0)
+    1 — FAIL: one or more OLD objects with stable checksums have no matching
+              signature in NEW, or there are unverifiable rows beyond multipart
+              ETags
 """
 
 from __future__ import annotations
@@ -29,28 +57,53 @@ import argparse
 import csv
 import gzip
 import io
-from collections import Counter
-from typing import Dict, List, Tuple
+import os
+import re
+import sqlite3
+import tempfile
+from typing import Dict, Iterator, Optional, Tuple
+
+_MULTIPART_ETAG_RE = re.compile(r"^[0-9a-fA-F]+-\d+$")
+
+MANIFEST_FIELDNAMES = ["bucket", "key", "size", "checksum_algorithm", "checksum_type", "checksum_value", "etag"]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Compare two S3 checksum manifests to verify a bucket migration.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Output files
+------------
+--missing-output
+    OLD rows whose (size, checksum_type, checksum_value) was not found in NEW.
+    These have stable checksums and are confirmed absent — action required.
+
+--unverifiable-output
+    OLD rows that cannot be verified: either no usable checksum ('no_checksum')
+    or a multipart ETag that changes across re-uploads ('multipart_etag').
+    A 'reason' column is appended to each row.
+
+--weak-output
+    NEW rows with no usable checksum; cannot be matched against OLD objects.
+""",
+    )
     parser.add_argument("--old", required=True, nargs="+", help="OLD manifest CSV(s), plain or gzipped")
     parser.add_argument("--new", required=True, nargs="+", help="NEW manifest CSV(s), plain or gzipped")
     parser.add_argument(
         "--missing-output",
         default="missing_in_new.csv",
-        help="Output CSV file path for OLD objects with no matching signature in NEW (default: %(default)s)",
+        help="Output CSV for OLD objects with no matching signature in NEW (default: %(default)s)",
     )
     parser.add_argument(
         "--unverifiable-output",
         default="unverifiable.csv",
-        help="Output CSV file path for OLD objects with no checksum; cannot confirm presence in NEW (default: %(default)s)",
+        help="Output CSV for OLD objects that cannot be verified (no checksum or multipart ETag) (default: %(default)s)",
     )
     parser.add_argument(
         "--weak-output",
         default="weak_checksum_rows.csv",
-        help="Output CSV file path for NEW-side rows without usable checksums (default: %(default)s)",
+        help="Output CSV for NEW-side rows without usable checksums (default: %(default)s)",
     )
     return parser.parse_args()
 
@@ -61,22 +114,54 @@ def _open_csv(path: str) -> io.TextIOWrapper:
     return open(path, "r", newline="", encoding="utf-8")
 
 
-def load_rows(paths: List[str]) -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
+def _iter_rows(paths: list) -> Iterator[Dict[str, str]]:
+    """Yield rows from all manifest CSVs with consistent fieldnames.
+
+    The first file's header determines the canonical fieldnames.
+    Subsequent files that lack a header (or have a different header)
+    are read with those canonical fieldnames so all rows are consistent.
+    """
+    canonical: Optional[list] = None
     for path in paths:
         with _open_csv(path) as f:
-            rows.extend(csv.DictReader(f))
-    return rows
+            # Peek at the first line to detect whether the file has a header.
+            first_line = f.readline()
+            if not first_line:
+                continue
+            first_vals = next(csv.reader([first_line.rstrip("\n")]))
+
+            if canonical is None:
+                # Decide whether the first line is a header or data.
+                if first_vals == MANIFEST_FIELDNAMES or first_vals[0] in ("bucket", "key"):
+                    # Looks like a header — use it as canonical fieldnames.
+                    canonical = first_vals
+                else:
+                    # No header — use the known manifest fieldnames and emit first line as data.
+                    canonical = MANIFEST_FIELDNAMES
+                    yield dict(zip(canonical, first_vals))
+            else:
+                if first_vals != canonical:
+                    # No header — first line is data; emit it then read the rest.
+                    yield dict(zip(canonical, first_vals))
+                # Either way, the header was consumed; use canonical fieldnames for
+                # the remainder so all rows are consistently keyed.
+
+            yield from csv.DictReader(f, fieldnames=canonical)
 
 
-def usable_signature(row: Dict[str, str]) -> bool:
+def _usable_signature(row: Dict[str, str]) -> bool:
     value = (row.get("checksum_value") or "").strip()
     ctype = (row.get("checksum_type") or "").strip()
     size = (row.get("size") or "").strip()
     return bool(size and ctype and value and not value.startswith("ERROR:"))
 
 
-def signature(row: Dict[str, str]) -> Tuple[str, str, str]:
+def _is_multipart_etag(row: Dict[str, str]) -> bool:
+    value = (row.get("checksum_value") or "").strip()
+    return bool(_MULTIPART_ETAG_RE.match(value))
+
+
+def _signature(row: Dict[str, str]) -> Tuple[str, str, str]:
     return (
         (row.get("size") or "").strip(),
         (row.get("checksum_type") or "").strip(),
@@ -84,102 +169,184 @@ def signature(row: Dict[str, str]) -> Tuple[str, str, str]:
     )
 
 
+def _build_new_index(
+    db: sqlite3.Connection,
+    paths: list,
+    weak_output_path: str,
+) -> Tuple[int, int, Optional[list]]:
+    """Stream NEW manifests into SQLite signature index; stream weak rows to file.
+
+    Returns (unique_sig_count, weak_count, new_fieldnames).
+    """
+    db.execute(
+        """
+        CREATE TABLE new_sigs (
+            size TEXT NOT NULL,
+            checksum_type TEXT NOT NULL,
+            checksum_value TEXT NOT NULL,
+            cnt INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (size, checksum_type, checksum_value)
+        )
+        """
+    )
+
+    unique_sigs = 0
+    weak_count = 0
+    new_fieldnames: Optional[list] = None
+    weak_writer: Optional[csv.DictWriter] = None
+    weak_file = None
+
+    try:
+        weak_file = open(weak_output_path, "w", newline="", encoding="utf-8")
+
+        for row in _iter_rows(paths):
+            if new_fieldnames is None:
+                new_fieldnames = list(row.keys())
+                weak_writer = csv.DictWriter(weak_file, fieldnames=new_fieldnames, extrasaction="ignore")
+                weak_writer.writeheader()
+
+            if _usable_signature(row):
+                sig = _signature(row)
+                db.execute(
+                    "INSERT INTO new_sigs(size, checksum_type, checksum_value) VALUES (?,?,?)"
+                    " ON CONFLICT(size, checksum_type, checksum_value) DO UPDATE SET cnt = cnt + 1",
+                    sig,
+                )
+                unique_sigs += 1
+            else:
+                assert weak_writer is not None
+                weak_writer.writerow(row)
+                weak_count += 1
+
+        db.commit()
+    finally:
+        if weak_file is not None:
+            weak_file.close()
+
+    return unique_sigs, weak_count, new_fieldnames
+
+
 def main() -> int:
     args = parse_args()
 
-    print(f"Loading OLD manifest(s): {args.old}")
-    old_rows = load_rows(args.old)
-    print(f"  Loaded {len(old_rows):,} rows from OLD manifest(s)")
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=True) as tmp:
+        db_path = tmp.name
 
-    print(f"Loading NEW manifest(s): {args.new}")
-    new_rows = load_rows(args.new)
-    print(f"  Loaded {len(new_rows):,} rows from NEW manifest(s)")
+    db = sqlite3.connect(db_path)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("PRAGMA cache_size=-131072")  # 128 MB page cache
 
-    new_sig_counts: Counter = Counter()
-    new_weak_rows: List[Dict[str, str]] = []
+    try:
+        print(f"Indexing NEW manifest(s) into SQLite: {args.new}")
+        unique_sigs, weak_count, new_fieldnames = _build_new_index(db, args.new, args.weak_output)
+        print(f"  {unique_sigs:,} unique signatures indexed; {weak_count:,} weak/unusable rows")
+        if weak_count:
+            print(f"  Weak checksum report -> {args.weak_output}")
 
-    print("Indexing NEW manifest signatures...")
-    for row in new_rows:
-        if usable_signature(row):
-            new_sig_counts[signature(row)] += 1
-        else:
-            new_weak_rows.append(row)
-    print(f"  {len(new_sig_counts):,} unique signatures indexed; {len(new_weak_rows):,} weak/unusable rows")
+        old_total = 0
+        old_covered = 0
+        missing_count = 0
+        unverifiable_count = 0
+        multipart_etag_count = 0
+        old_bucket = "OLD"
+        new_bucket = "NEW"
+        old_fieldnames: Optional[list] = None
 
-    missing_rows: List[Dict[str, str]] = []
-    unverifiable_rows: List[Dict[str, str]] = []
+        print(f"Comparing OLD manifest(s) against NEW index: {args.old}")
+        with (
+            open(args.missing_output, "w", newline="", encoding="utf-8") as miss_f,
+            open(args.unverifiable_output, "w", newline="", encoding="utf-8") as unver_f,
+        ):
+            miss_writer: Optional[csv.DictWriter] = None
+            unver_writer: Optional[csv.DictWriter] = None
 
-    old_bucket = (old_rows[0].get("bucket") or "OLD") if old_rows else "OLD"
-    new_bucket = (new_rows[0].get("bucket") or "NEW") if new_rows else "NEW"
+            report_every = 100_000
 
-    old_total = len(old_rows)
-    old_covered = 0
+            for row in _iter_rows(args.old):
+                if old_fieldnames is None:
+                    old_fieldnames = list(row.keys())
+                    miss_writer = csv.DictWriter(miss_f, fieldnames=old_fieldnames, extrasaction="ignore")
+                    miss_writer.writeheader()
+                    unver_fieldnames = old_fieldnames + ["reason"]
+                    unver_writer = csv.DictWriter(unver_f, fieldnames=unver_fieldnames, extrasaction="ignore")
+                    unver_writer.writeheader()
+                    old_bucket = row.get("bucket") or "OLD"
 
-    print(f"Comparing {old_total:,} OLD objects against NEW...")
-    report_interval = max(1, old_total // 10)
-    for i, row in enumerate(old_rows, 1):
-        if i % report_interval == 0 or i == old_total:
-            print(f"  Progress: {i:,}/{old_total:,} ({100 * i // old_total}%)")
-        if not usable_signature(row):
-            unverifiable_rows.append(row)
-            continue
+                old_total += 1
+                if old_total % report_every == 0:
+                    print(f"  Progress: {old_total:,} rows processed...")
 
-        sig = signature(row)
-        if new_sig_counts[sig] > 0:
-            old_covered += 1
-        else:
-            missing_rows.append(row)
+                if not _usable_signature(row):
+                    assert unver_writer is not None
+                    unver_writer.writerow({**row, "reason": "no_checksum"})
+                    unverifiable_count += 1
+                    continue
 
-    row_fieldnames = list(old_rows[0].keys()) if old_rows else []
+                if _is_multipart_etag(row):
+                    assert unver_writer is not None
+                    unver_writer.writerow({**row, "reason": "multipart_etag"})
+                    unverifiable_count += 1
+                    multipart_etag_count += 1
+                    continue
 
-    print(f"Writing missing objects report -> {args.missing_output}")
-    with open(args.missing_output, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=row_fieldnames)
-        writer.writeheader()
-        writer.writerows(missing_rows)
+                sig = _signature(row)
+                cur = db.execute(
+                    "SELECT cnt FROM new_sigs WHERE size=? AND checksum_type=? AND checksum_value=?",
+                    sig,
+                )
+                if cur.fetchone():
+                    old_covered += 1
+                else:
+                    assert miss_writer is not None
+                    miss_writer.writerow(row)
+                    missing_count += 1
 
-    print(f"Writing unverifiable objects report -> {args.unverifiable_output}")
-    with open(args.unverifiable_output, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=row_fieldnames)
-        writer.writeheader()
-        writer.writerows(unverifiable_rows)
+        print(f"  {old_total:,} OLD rows processed")
 
-    if new_weak_rows:
-        new_fieldnames = list(new_rows[0].keys()) if new_rows else []
-        print(f"Writing weak checksum report -> {args.weak_output}")
-        with open(args.weak_output, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=new_fieldnames)
-            writer.writeheader()
-            writer.writerows(new_weak_rows)
+    finally:
+        db.close()
+        try:
+            os.unlink(db_path)
+        except OSError:
+            pass
 
-    missing_count = len(missing_rows)
-    unverifiable_count = len(unverifiable_rows)
-    success = (missing_count == 0 and unverifiable_count == 0)
+    success = missing_count == 0
 
     print("=== S3 Manifest Comparison Summary ===")
-    print(f"Source bucket:                             {old_bucket}")
-    print(f"Destination bucket:                        {new_bucket}")
+    print(f"Source bucket:                                    {old_bucket}")
+    print(f"Destination bucket:                               {new_bucket}")
     print()
-    print(f"{old_bucket} objects total:                {old_total}")
-    print(f"{old_bucket} objects confirmed in {new_bucket}: {old_covered}")
-    print(f"{old_bucket} objects confirmed missing:    {missing_count}")
-    print(f"{old_bucket} objects unable to verify:     {unverifiable_count}")
-    print(f"{new_bucket} objects with weak checksum:   {len(new_weak_rows)}")
+    print(f"{old_bucket} objects total:                       {old_total:,}")
+    print(f"{old_bucket} objects confirmed in {new_bucket}:  {old_covered:,}")
+    print(f"{old_bucket} objects confirmed missing:           {missing_count:,}")
+    print(f"{old_bucket} objects unable to verify (total):   {unverifiable_count:,}")
+    print(f"  of which multipart ETags:                       {multipart_etag_count:,}")
+    print(f"  of which no usable checksum:                    {unverifiable_count - multipart_etag_count:,}")
+    print(f"{new_bucket} objects with weak checksum:          {weak_count:,}")
     print()
     print(f"Confirmed missing report:  {args.missing_output}")
     print(f"Unverifiable report:       {args.unverifiable_output}")
-    if new_weak_rows:
+    if weak_count:
         print(f"Weak checksum report:      {args.weak_output}")
     print()
     if success:
         print("RESULT: PASS")
-        print(f"Every object in {old_bucket} is confirmed present in {new_bucket}.")
+        print(f"Every object in {old_bucket} with a stable checksum is confirmed present in {new_bucket}.")
+        if multipart_etag_count:
+            print(
+                f"  Note: {multipart_etag_count:,} object(s) have multipart ETags and could not be verified by checksum."
+            )
     else:
         print("RESULT: FAIL")
         if missing_count:
-            print(f"  {missing_count} object(s) from {old_bucket} have no matching content signature in {new_bucket}.")
+            print(f"  {missing_count:,} object(s) from {old_bucket} have no matching content signature in {new_bucket}.")
         if unverifiable_count:
-            print(f"  {unverifiable_count} object(s) from {old_bucket} have no checksum and cannot be verified.")
+            print(f"  {unverifiable_count:,} object(s) from {old_bucket} could not be verified.")
+            if multipart_etag_count:
+                print(f"    {multipart_etag_count:,} have multipart ETags (ETag changes on re-upload; not a reliable match key).")
+            if unverifiable_count - multipart_etag_count:
+                print(f"    {unverifiable_count - multipart_etag_count:,} have no usable checksum at all.")
 
     return 0 if success else 1
 

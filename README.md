@@ -9,11 +9,208 @@ Install with:
 
     pip install pds.cloud-tools
 
-If possible, make it so that your program works out of the box without any additional configuration—but see the [Configuration](###configuration) section for details.
 
-To execute, run:
+## S3 Download (`pdc-s3-download`)
 
-    (put your run commands here)
+Downloads objects from an S3 bucket matching a given prefix to a local directory, preserving the key structure as a directory tree.
+
+### Basic usage
+
+```bash
+pdc-s3-download \
+  --source-profile my-aws-profile \
+  --source-bucket my-bucket \
+  --source-prefix path/to/objects/ \
+  --local-dest-dir ./downloads
+```
+
+`--source-profile` and `--source-bucket` can also be supplied via the `AWS_PROFILE` and `AWS_BUCKET` environment variables.
+
+### Filtering by last-modified time
+
+Use `--start-datetime` and/or `--end-datetime` to restrict downloads to objects last modified within a time range. All datetimes are UTC. Accepted formats: `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS`.
+
+| Arguments provided | Behavior |
+|--------------------|----------|
+| `--start-datetime` only | Download objects modified from start to now |
+| `--end-datetime` only | Download objects modified up to end |
+| Both | Download objects modified within [start, end] |
+| Neither | Download all matching objects |
+
+```bash
+# Download only objects modified in January 2025
+pdc-s3-download \
+  --source-profile my-aws-profile \
+  --source-bucket my-bucket \
+  --source-prefix path/to/objects/ \
+  --local-dest-dir ./downloads \
+  --start-datetime 2025-01-01 \
+  --end-datetime 2025-02-01
+
+# Download everything modified since a specific timestamp
+pdc-s3-download \
+  --source-profile my-aws-profile \
+  --source-bucket my-bucket \
+  --source-prefix path/to/objects/ \
+  --local-dest-dir ./downloads \
+  --start-datetime 2025-06-15T12:00:00
+```
+
+
+## Data Integrity Verification (S3 Bucket Migration)
+
+Use these two tools to verify that every object in an OLD S3 bucket has a matching copy in a NEW bucket — by content (size + checksum), not just by key name.
+
+### Overview
+
+| Command | Purpose |
+|---------|---------|
+| `pdc-build-checksum-manifest` | Generate a CSV manifest of every object in a bucket with its checksum, size, and ETag |
+| `pdc-compare-manifests` | Compare two manifests and report any OLD objects not represented in NEW |
+
+### AWS Credentials Setup
+
+The scripts use standard boto3 credential resolution. Options, in order of preference:
+
+**Named profile** (recommended):
+
+```ini
+# ~/.aws/credentials
+[old-account]
+aws_access_key_id = AKIA...
+aws_secret_access_key = ...
+
+[new-account]
+aws_access_key_id = AKIA...
+aws_secret_access_key = ...
+```
+
+**IAM role assumption** (for cross-account access without long-lived keys):
+
+```ini
+# ~/.aws/config
+[profile new-account]
+role_arn = arn:aws:iam::123456789012:role/DataMigrationRole
+source_profile = old-account
+region = us-west-2
+```
+
+**Environment variables** (for CI/automation):
+
+```bash
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...   # required when using temporary credentials
+```
+
+**Minimum required IAM permissions** for each bucket:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "s3:ListBucket",
+    "s3:GetObject",
+    "s3:GetObjectAttributes"
+  ],
+  "Resource": [
+    "arn:aws:s3:::your-bucket-name",
+    "arn:aws:s3:::your-bucket-name/*"
+  ]
+}
+```
+
+### Step-by-Step Workflow
+
+**Step 1 — Generate the OLD bucket manifest:**
+
+```bash
+pdc-build-checksum-manifest \
+  --bucket old-bucket-name \
+  --output old_manifest.csv \
+  --profile old-account \
+  --region us-west-2
+```
+
+**Step 2 — Generate the NEW bucket manifest:**
+
+```bash
+pdc-build-checksum-manifest \
+  --bucket new-bucket-name \
+  --output new_manifest.csv \
+  --profile new-account \
+  --region us-west-2
+```
+
+**Step 3 — Compare the manifests:**
+
+```bash
+pdc-compare-manifests \
+  --old old_manifest.csv \
+  --new new_manifest.csv \
+  --missing-output missing_in_new.csv \
+  --weak-output weak_checksums.csv
+```
+
+The comparison exits with code `0` (PASS) if every OLD object has a matching content signature in NEW, or `1` (FAIL) if any are missing.
+
+Sample output:
+
+```
+=== S3 Manifest Comparison Summary ===
+OLD objects total:               4823901
+OLD objects covered by NEW:      4823901
+OLD objects missing in NEW:      0
+OLD objects with weak checksum:  142
+Missing report:                  missing_in_new.csv
+Weak rows report:                weak_checksums.csv
+
+RESULT: PASS
+Every OLD object has at least one matching content signature in NEW.
+```
+
+### Handling Buckets with Millions of Objects
+
+Manifest generation uses the `list_objects_v2` paginator, which pages through arbitrarily large buckets automatically — there is no per-bucket size limit. Progress is printed to stderr every 1,000 objects.
+
+The comparison step loads both manifests into memory simultaneously. For very large buckets (tens of millions of objects), ensure the host has sufficient RAM.
+
+### Resuming After a Failure
+
+If manifest generation is interrupted (timeout, credential expiry, network error), resume by passing the partial output file as `--resume-from`. Both `--output` and `--resume-from` must point to the same file:
+
+```bash
+# Initial run (interrupted):
+pdc-build-checksum-manifest \
+  --bucket old-bucket-name \
+  --output old_manifest.csv \
+  --profile old-account
+
+# Resume run — pass the same file to both flags:
+pdc-build-checksum-manifest \
+  --bucket old-bucket-name \
+  --output old_manifest.csv \
+  --resume-from old_manifest.csv \
+  --profile old-account
+```
+
+The resume run appends new rows to the existing CSV and skips any key already recorded in it.
+
+### Understanding the Output Files
+
+**`missing_in_new.csv`** — OLD objects not found in NEW, with a `reason` column:
+
+| Reason | Meaning |
+|--------|---------|
+| `NO_MATCHING_SIGNATURE_IN_NEW` | Object content (size + checksum) not present in NEW |
+| `NO_USABLE_CHECKSUM` | Object has no stored checksum; cannot verify by content signature |
+
+**`weak_checksums.csv`** — rows from either manifest lacking a usable checksum. This occurs when objects were uploaded without `--checksum-algorithm`. These objects cannot be verified by content signature alone.
+
+### Limitations
+
+- Checksums are only present if they were stored at upload time. Objects copied with `aws s3 cp` without `--checksum-algorithm` will have no checksum and appear in the weak-checksum report.
+- Matching is by content signature `(size, checksum_type, checksum_value)`, not by key. An object that was renamed or moved but has identical content will be counted as covered.
 
 
 ## Code of Conduct

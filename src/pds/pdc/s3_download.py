@@ -2,19 +2,45 @@
 """Download files from an S3 bucket to a local directory.
 
 This script uses the boto3 library to download objects from a specified S3
-bucket that match a given prefix. The AWS profile, S3 bucket name, prefix,
-and local destination directory are provided as command-line arguments or
-through the AWS_PROFILE and AWS_BUCKET environment variables.
+bucket that match a given prefix. Objects can optionally be filtered by their
+last-modified timestamp. The AWS profile, S3 bucket name, prefix, and local
+destination directory are provided as command-line arguments or through the
+AWS_PROFILE and AWS_BUCKET environment variables.
 
 Usage:
-    python s3_download.py --source-prefix prefix/path/to/objects/ --local-dest-dir local/path/
+    pdc-s3-download --source-prefix prefix/path/to/objects/ --local-dest-dir local/path/
+    pdc-s3-download --source-prefix prefix/ --local-dest-dir local/ --start-datetime 2025-01-01
+    pdc-s3-download --source-prefix prefix/ --local-dest-dir local/ \\
+        --start-datetime 2025-01-01T00:00:00 --end-datetime 2025-06-01T00:00:00
+
+    All datetimes are interpreted as UTC. Accepted formats: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS.
+
+    Time range behavior:
+        --start-datetime only  → download objects modified from start to now
+        --end-datetime only    → download objects modified up to end
+        both provided          → download objects modified within [start, end]
+        neither provided       → download all objects (no time filter)
+
     (Optionally set AWS_PROFILE and AWS_BUCKET in your environment)
 """
 import argparse
 import os
+from datetime import datetime
+from datetime import timezone
 
 import boto3
 from botocore.exceptions import ClientError
+
+
+def parse_datetime(value):
+    """Parse a datetime string in ISO 8601 format, returning an aware UTC datetime."""
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    raise argparse.ArgumentTypeError(f"Invalid datetime format: '{value}'. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS.")
 
 
 def main():
@@ -24,20 +50,34 @@ def main():
     default_source_bucket = os.environ.get("AWS_BUCKET")
 
     parser = argparse.ArgumentParser(
-        description="Download files from an S3 bucket (filtered by a prefix) " "to a local directory."
+        description="Download files from an S3 bucket (filtered by a prefix) to a local directory."
     )
     parser.add_argument(
         "--source-profile",
         default=default_source_profile,
-        help=("AWS profile name for the source bucket " "(defaults to AWS_PROFILE environment variable)"),
+        help=("AWS profile name for the source bucket (defaults to AWS_PROFILE environment variable)"),
     )
     parser.add_argument(
         "--source-bucket",
         default=default_source_bucket,
-        help=("Name of the source S3 bucket " "(defaults to AWS_BUCKET environment variable)"),
+        help=("Name of the source S3 bucket (defaults to AWS_BUCKET environment variable)"),
     )
     parser.add_argument("--source-prefix", required=True, help="Prefix in the source bucket to filter objects")
     parser.add_argument("--local-dest-dir", required=True, help="Local directory where files will be downloaded")
+    parser.add_argument(
+        "--start-datetime",
+        type=parse_datetime,
+        default=None,
+        metavar="DATETIME",
+        help="Only download objects last modified at or after this datetime (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS, UTC)",
+    )
+    parser.add_argument(
+        "--end-datetime",
+        type=parse_datetime,
+        default=None,
+        metavar="DATETIME",
+        help="Only download objects last modified before or at this datetime (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS, UTC). Defaults to now if --start-datetime is provided.",
+    )
 
     args = parser.parse_args()
 
@@ -52,6 +92,11 @@ def main():
     source_prefix = args.source_prefix
     local_dest_dir = args.local_dest_dir
 
+    start_dt = args.start_datetime
+    end_dt = args.end_datetime
+    if start_dt and not end_dt:
+        end_dt = datetime.now(tz=timezone.utc)
+
     # Create a session for the source AWS profile and initialize S3 resource
     source_session = boto3.Session(profile_name=source_profile)
     source_s3 = source_session.resource("s3")
@@ -64,11 +109,20 @@ def main():
     # Loop through objects with the specified prefix in the source bucket
     for obj in source_bucket.objects.filter(Prefix=source_prefix):
         # Remove the source prefix from the object's key to construct a relative path
-        relative_path = obj.key[len(source_prefix) :]
+        relative_path = obj.key[len(source_prefix) :].lstrip("/")
 
         # Skip directory markers or keys that resolve to an empty relative path
         if not relative_path or obj.key.endswith("/"):
             print(f"Skipping directory marker or empty key: {obj.key}")
+            continue
+
+        # Filter by last modified time range if specified
+        last_modified = obj.last_modified
+        if start_dt and last_modified < start_dt:
+            print(f"Skipping {obj.key} (last modified {last_modified} is before {start_dt})")
+            continue
+        if end_dt and last_modified > end_dt:
+            print(f"Skipping {obj.key} (last modified {last_modified} is after {end_dt})")
             continue
 
         # Construct the local file path
