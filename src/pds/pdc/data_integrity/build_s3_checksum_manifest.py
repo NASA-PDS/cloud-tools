@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Build a per-object checksum manifest for an S3 bucket.
+"""Build a per-object checksum manifest for an S3 bucket.
 
 Checksum resolution order (first match wins):
   1. Native S3 checksum from GetObjectAttributes (CRC64NVME preferred)
@@ -19,14 +18,17 @@ Optional:
   --region us-west-2
   --resume-from manifest.csv   # resume an interrupted run (same file as --output)
 """
-
 from __future__ import annotations
 
 import argparse
 import csv
 import sys
 import time
-from typing import Dict, Iterable, Optional, Set, Tuple
+from typing import Dict
+from typing import Iterable
+from typing import Optional
+from typing import Set
+from typing import Tuple
 
 import boto3
 from botocore.config import Config
@@ -53,6 +55,7 @@ CSV_HEADERS = [
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--bucket", required=True, help="S3 bucket name")
     parser.add_argument("--output", required=True, help="Output CSV path")
@@ -67,16 +70,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_session(profile: Optional[str], region: Optional[str]):
-    session_kwargs = {}
+def build_session(profile: Optional[str], region: Optional[str]) -> boto3.Session:
+    """Create a boto3 Session with optional profile and region."""
+    if profile and region:
+        return boto3.Session(profile_name=profile, region_name=region)
     if profile:
-        session_kwargs["profile_name"] = profile
+        return boto3.Session(profile_name=profile)
     if region:
-        session_kwargs["region_name"] = region
-    return boto3.Session(**session_kwargs)
+        return boto3.Session(region_name=region)
+    return boto3.Session()
 
 
 def load_existing_keys(csv_path: str) -> Set[str]:
+    """Load already-processed keys from an existing manifest CSV."""
     keys: Set[str] = set()
     with open(csv_path, "r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -86,8 +92,8 @@ def load_existing_keys(csv_path: str) -> Set[str]:
 
 
 def choose_checksum(resp: Dict) -> Tuple[str, str, str]:
-    """
-    Prefer CRC64NVME if present. Otherwise take the first available checksum.
+    """Prefer CRC64NVME if present, otherwise take first available checksum.
+
     Returns: (algorithm, checksum_type, checksum_value)
     """
     checksum = resp.get("Checksum", {}) or {}
@@ -102,6 +108,7 @@ def choose_checksum(resp: Dict) -> Tuple[str, str, str]:
 
 
 def list_objects(s3_client, bucket: str, prefix: str) -> Iterable[Dict]:
+    """Paginate over all objects in a bucket matching the given prefix."""
     paginator = s3_client.get_paginator("list_objects_v2")
     kwargs = {"Bucket": bucket}
     if prefix:
@@ -113,6 +120,7 @@ def list_objects(s3_client, bucket: str, prefix: str) -> Iterable[Dict]:
 
 
 def get_object_attrs_with_retry(s3_client, bucket: str, key: str, retries: int = 5) -> Dict:
+    """Call GetObjectAttributes with exponential-backoff retry on throttle errors."""
     delay = 1.0
     for attempt in range(retries):
         try:
@@ -128,9 +136,11 @@ def get_object_attrs_with_retry(s3_client, bucket: str, key: str, retries: int =
                 delay *= 2
                 continue
             raise
+    raise RuntimeError(f"Exhausted {retries} retries for GetObjectAttributes on {key}")
 
 
 def head_object_with_retry(s3_client, bucket: str, key: str, retries: int = 5) -> Dict:
+    """Call HeadObject with exponential-backoff retry on throttle errors."""
     delay = 1.0
     for attempt in range(retries):
         try:
@@ -142,6 +152,7 @@ def head_object_with_retry(s3_client, bucket: str, key: str, retries: int = 5) -
                 delay *= 2
                 continue
             raise
+    raise RuntimeError(f"Exhausted {retries} retries for HeadObject on {key}")
 
 
 def parse_s3cmd_md5(attrs_value: str) -> str:
@@ -159,6 +170,7 @@ def parse_s3cmd_md5(attrs_value: str) -> str:
 
 
 def main() -> int:
+    """Build a checksum manifest CSV for all objects in an S3 bucket."""
     args = parse_args()
 
     session = build_session(args.profile, args.region)
@@ -215,15 +227,17 @@ def main() -> int:
                 checksum_type = ""
                 checksum_value = f"ERROR:{err_code}"
 
-            writer.writerow([
-                args.bucket,
-                key,
-                size,
-                algo,
-                checksum_type,
-                checksum_value,
-                etag,
-            ])
+            writer.writerow(
+                [
+                    args.bucket,
+                    key,
+                    size,
+                    algo,
+                    checksum_type,
+                    checksum_value,
+                    etag,
+                ]
+            )
             count += 1
 
             if count % 1000 == 0:

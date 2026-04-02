@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Download files from an S3 bucket to a local directory.
+r"""Download files from an S3 bucket to a local directory.
 
 This script uses the boto3 library to download objects from a specified S3
 bucket that match a given prefix. Objects can optionally be filtered by their
@@ -76,7 +76,11 @@ def main():
         type=parse_datetime,
         default=None,
         metavar="DATETIME",
-        help="Only download objects last modified before or at this datetime (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS, UTC). Defaults to now if --start-datetime is provided.",
+        help=(
+            "Only download objects last modified before or at this datetime "
+            "(YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS, UTC). "
+            "Defaults to now if --start-datetime is provided."
+        ),
     )
 
     args = parser.parse_args()

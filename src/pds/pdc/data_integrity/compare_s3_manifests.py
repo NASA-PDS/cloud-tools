@@ -50,7 +50,6 @@ Exit codes:
               signature in NEW, or there are unverifiable rows beyond multipart
               ETags
 """
-
 from __future__ import annotations
 
 import argparse
@@ -61,7 +60,10 @@ import os
 import re
 import sqlite3
 import tempfile
-from typing import Dict, Iterator, Optional, Tuple
+from typing import Dict
+from typing import Iterator
+from typing import Optional
+from typing import Tuple
 
 _MULTIPART_ETAG_RE = re.compile(r"^[0-9a-fA-F]+-\d+$")
 
@@ -69,6 +71,7 @@ MANIFEST_FIELDNAMES = ["bucket", "key", "size", "checksum_algorithm", "checksum_
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Compare two S3 checksum manifests to verify a bucket migration.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -227,6 +230,7 @@ def _build_new_index(
 
 
 def main() -> int:
+    """Compare two S3 checksum manifests and report missing or unverifiable objects."""
     args = parse_args()
 
     with tempfile.NamedTemporaryFile(suffix=".db", delete=True) as tmp:
@@ -340,11 +344,15 @@ def main() -> int:
     else:
         print("RESULT: FAIL")
         if missing_count:
-            print(f"  {missing_count:,} object(s) from {old_bucket} have no matching content signature in {new_bucket}.")
+            print(
+                f"  {missing_count:,} object(s) from {old_bucket} have no matching content signature in {new_bucket}."
+            )
         if unverifiable_count:
             print(f"  {unverifiable_count:,} object(s) from {old_bucket} could not be verified.")
             if multipart_etag_count:
-                print(f"    {multipart_etag_count:,} have multipart ETags (ETag changes on re-upload; not a reliable match key).")
+                print(
+                    f"    {multipart_etag_count:,} have multipart ETags (ETag changes on re-upload; not a reliable match key)."
+                )
             if unverifiable_count - multipart_etag_count:
                 print(f"    {unverifiable_count - multipart_etag_count:,} have no usable checksum at all.")
 
