@@ -17,6 +17,7 @@ Optional:
   --profile my-aws-profile
   --region us-west-2
   --resume-from manifest.csv   # resume an interrupted run (same file as --output)
+  --max-objects 1000           # stop after N objects (dry run / smoke test)
 """
 from __future__ import annotations
 
@@ -66,6 +67,12 @@ def parse_args() -> argparse.Namespace:
         "--resume-from",
         default=None,
         help="Existing manifest CSV to skip already-processed keys",
+    )
+    parser.add_argument(
+        "--max-objects",
+        type=int,
+        default=None,
+        help="Stop after processing this many objects (useful for dry runs)",
     )
     return parser.parse_args()
 
@@ -242,6 +249,10 @@ def main() -> int:
 
             if count % 1000 == 0:
                 print(f"Processed {count} objects...", file=sys.stderr)
+
+            if args.max_objects and count >= args.max_objects:
+                print(f"Reached --max-objects limit of {args.max_objects}. Stopping.", file=sys.stderr)
+                break
 
     print(f"Done. Wrote manifest to {args.output}", file=sys.stderr)
     return 0
