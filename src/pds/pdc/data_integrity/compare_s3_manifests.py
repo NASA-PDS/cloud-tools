@@ -6,7 +6,13 @@ Goal:
     by content signature, regardless of key name or bucket name.
 
 Matching strategy:
-    Objects are matched on the tuple (size, checksum_type, checksum_value).
+    Primary match: objects are matched on (size, checksum_type, checksum_value).
+    Cross-type match (S3CMD-MD5 → ETag): when an OLD object's only checksum is
+    an MD5 extracted from x-amz-meta-s3cmd-attrs metadata (checksum_type "MD5"),
+    it is matched against the NEW object's ETag.  For single-part uploads the S3
+    ETag equals the content MD5, so these two values are equivalent.  Multipart
+    ETags (ending in -<N>) are excluded from this secondary index because they
+    are not content MD5s.
     Key names are intentionally ignored so renamed objects still count as present.
 
 Multipart ETags:
@@ -43,6 +49,15 @@ Output files:
         used to confirm migration coverage for any OLD object.
         Action required: re-run checksum generation on NEW for these objects.
 
+    --matched-output (default: matched_objects.csv)
+        One row per OLD object that was confirmed present in NEW.  Columns:
+          old_bucket, old_key, old_size, old_checksum_algorithm,
+          old_checksum_type, old_checksum_value, old_etag,
+          new_bucket, new_key, match_type
+        match_type is ``primary`` for native-checksum matches or ``etag_md5``
+        when an S3CMD-MD5 value was matched against the destination ETag.
+        Use this file as the definitive object-to-object migration inventory.
+
 Exit codes:
     0 — PASS: every OLD object is either confirmed present in NEW or is
               unverifiable due to a multipart ETag (i.e. missing_count == 0)
@@ -69,6 +84,19 @@ _MULTIPART_ETAG_RE = re.compile(r"^[0-9a-fA-F]+-\d+$")
 
 MANIFEST_FIELDNAMES = ["bucket", "key", "size", "checksum_algorithm", "checksum_type", "checksum_value", "etag"]
 
+MATCHED_FIELDNAMES = [
+    "old_bucket",
+    "old_key",
+    "old_size",
+    "old_checksum_algorithm",
+    "old_checksum_type",
+    "old_checksum_value",
+    "old_etag",
+    "new_bucket",
+    "new_key",
+    "match_type",
+]
+
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
@@ -89,6 +117,10 @@ Output files
 
 --weak-output
     NEW rows with no usable checksum; cannot be matched against OLD objects.
+
+--matched-output
+    One row per confirmed match: old and new bucket/key/checksum plus match_type
+    ('primary' or 'etag_md5').  Use as the definitive migration inventory.
 """,
     )
     parser.add_argument("--old", required=True, nargs="+", help="OLD manifest CSV(s), plain or gzipped")
@@ -107,6 +139,11 @@ Output files
         "--weak-output",
         default="weak_checksum_rows.csv",
         help="Output CSV for NEW-side rows without usable checksums (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--matched-output",
+        default="matched_objects.csv",
+        help="Output CSV mapping each confirmed OLD→NEW object pair (default: %(default)s)",
     )
     return parser.parse_args()
 
@@ -179,6 +216,15 @@ def _build_new_index(
 ) -> Tuple[int, int, Optional[list]]:
     """Stream NEW manifests into SQLite signature index; stream weak rows to file.
 
+    Indexes two signatures per NEW object:
+      1. Primary: (size, checksum_type, checksum_value) — the native checksum.
+      2. Secondary (single-part only): (size, "MD5", etag) — allows OLD objects
+         whose only checksum is an S3CMD-MD5 to match against the destination
+         ETag, which equals the content MD5 for single-part uploads.
+
+    Stores a representative (new_bucket, new_key) per signature so the matched
+    output can record the actual NEW object path for each confirmed match.
+
     Returns (unique_sig_count, weak_count, new_fieldnames).
     """
     db.execute(
@@ -188,6 +234,8 @@ def _build_new_index(
             checksum_type TEXT NOT NULL,
             checksum_value TEXT NOT NULL,
             cnt INTEGER NOT NULL DEFAULT 1,
+            new_bucket TEXT NOT NULL DEFAULT '',
+            new_key TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (size, checksum_type, checksum_value)
         )
         """
@@ -210,12 +258,26 @@ def _build_new_index(
 
             if _usable_signature(row):
                 sig = _signature(row)
+                new_bucket = (row.get("bucket") or "").strip()
+                new_key = (row.get("key") or "").strip()
                 db.execute(
-                    "INSERT INTO new_sigs(size, checksum_type, checksum_value) VALUES (?,?,?)"
+                    "INSERT INTO new_sigs(size, checksum_type, checksum_value, new_bucket, new_key)"
+                    " VALUES (?,?,?,?,?)"
                     " ON CONFLICT(size, checksum_type, checksum_value) DO UPDATE SET cnt = cnt + 1",
-                    sig,
+                    (*sig, new_bucket, new_key),
                 )
                 unique_sigs += 1
+
+                # Secondary index: single-part ETag as MD5 so OLD rows with
+                # S3CMD-MD5 checksums can match against the destination ETag.
+                etag = (row.get("etag") or "").strip().strip('"')
+                size_val = sig[0]
+                if etag and size_val and not _MULTIPART_ETAG_RE.match(etag):
+                    db.execute(
+                        "INSERT OR IGNORE INTO new_sigs(size, checksum_type, checksum_value, new_bucket, new_key)"
+                        " VALUES (?,?,?,?,?)",
+                        (size_val, "MD5", etag, new_bucket, new_key),
+                    )
             else:
                 assert weak_writer is not None
                 weak_writer.writerow(row)
@@ -253,6 +315,7 @@ def main() -> int:
         missing_count = 0
         unverifiable_count = 0
         multipart_etag_count = 0
+        etag_md5_count = 0
         old_bucket = "OLD"
         new_bucket = "NEW"
         old_fieldnames: Optional[list] = None
@@ -261,9 +324,12 @@ def main() -> int:
         with (
             open(args.missing_output, "w", newline="", encoding="utf-8") as miss_f,
             open(args.unverifiable_output, "w", newline="", encoding="utf-8") as unver_f,
+            open(args.matched_output, "w", newline="", encoding="utf-8") as matched_f,
         ):
             miss_writer: Optional[csv.DictWriter] = None
             unver_writer: Optional[csv.DictWriter] = None
+            matched_writer = csv.DictWriter(matched_f, fieldnames=MATCHED_FIELDNAMES)
+            matched_writer.writeheader()
 
             report_every = 100_000
 
@@ -296,11 +362,34 @@ def main() -> int:
 
                 sig = _signature(row)
                 cur = db.execute(
-                    "SELECT cnt FROM new_sigs WHERE size=? AND checksum_type=? AND checksum_value=?",
+                    "SELECT cnt, new_bucket, new_key FROM new_sigs"
+                    " WHERE size=? AND checksum_type=? AND checksum_value=?",
                     sig,
                 )
-                if cur.fetchone():
+                hit = cur.fetchone()
+                if hit:
                     old_covered += 1
+                    _, hit_new_bucket, hit_new_key = hit
+                    if new_bucket == "NEW" and hit_new_bucket:
+                        new_bucket = hit_new_bucket
+                    algo = (row.get("checksum_algorithm") or "").strip()
+                    match_type = "etag_md5" if algo == "S3CMD-MD5" else "primary"
+                    if match_type == "etag_md5":
+                        etag_md5_count += 1
+                    matched_writer.writerow(
+                        {
+                            "old_bucket": row.get("bucket", ""),
+                            "old_key": row.get("key", ""),
+                            "old_size": row.get("size", ""),
+                            "old_checksum_algorithm": algo,
+                            "old_checksum_type": row.get("checksum_type", ""),
+                            "old_checksum_value": row.get("checksum_value", ""),
+                            "old_etag": row.get("etag", ""),
+                            "new_bucket": hit_new_bucket,
+                            "new_key": hit_new_key,
+                            "match_type": match_type,
+                        }
+                    )
                 else:
                     assert miss_writer is not None
                     miss_writer.writerow(row)
@@ -323,12 +412,15 @@ def main() -> int:
     print()
     print(f"{old_bucket} objects total:                       {old_total:,}")
     print(f"{old_bucket} objects confirmed in {new_bucket}:  {old_covered:,}")
+    print(f"  of which matched by native checksum:            {old_covered - etag_md5_count:,}")
+    print(f"  of which matched by ETag/MD5 cross-type:        {etag_md5_count:,}")
     print(f"{old_bucket} objects confirmed missing:           {missing_count:,}")
     print(f"{old_bucket} objects unable to verify (total):   {unverifiable_count:,}")
     print(f"  of which multipart ETags:                       {multipart_etag_count:,}")
     print(f"  of which no usable checksum:                    {unverifiable_count - multipart_etag_count:,}")
     print(f"{new_bucket} objects with weak checksum:          {weak_count:,}")
     print()
+    print(f"Matched objects report:    {args.matched_output}")
     print(f"Confirmed missing report:  {args.missing_output}")
     print(f"Unverifiable report:       {args.unverifiable_output}")
     if weak_count:

@@ -139,3 +139,9 @@ override.tf.json
 # Ignore CLI configuration files
 .terraformrc
 terraform.rc
+
+# Local data and runtime artifacts
+data/
+output/
+copy_state.db
+*.csv

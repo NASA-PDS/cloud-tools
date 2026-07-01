@@ -235,6 +235,7 @@ Install in editable mode and with extra developer dependencies into your virtual
     pip install --editable '.[dev]'
 
 ### Pre-commit
+
 Configure the `pre-commit` hooks:
 
     pre-commit install
@@ -242,9 +243,26 @@ Configure the `pre-commit` hooks:
     pre-commit install -t prepare-commit-msg
     pre-commit install -t commit-msg
 
-These hooks then will check for any future commits that might contain secrets. They also check code formatting, PEP8 compliance, type hints, etc.
+These hooks check for secrets, code formatting, PEP8 compliance, type hints, etc.
 
-👉 **Note:** A one time setup is required both to support `detect-secrets` and in your global Git configuration. See [the wiki entry on Secrets](https://github.com/NASA-PDS/nasa-pds.github.io/wiki/Git-and-Github-Guide#detect-secrets) to learn how.
+### Secret Detection
+
+This repo uses [`detect-secrets`](https://github.com/Yelp/detect-secrets) via `scripts/detect_secrets_baseline.sh`. The pre-commit hook runs the check automatically on every commit.
+
+**Per-repo exclusions** live in [`.detect-secrets-ignore`](.detect-secrets-ignore) — one regex per line, `#` for comments. Add paths or filename patterns there when a file legitimately contains placeholder/example values that trigger false positives (e.g. README credential examples).
+
+**Workflow:**
+
+```bash
+# Re-scan after adding new files or updating .detect-secrets-ignore
+scripts/detect_secrets_baseline.sh scan
+
+# Interactively audit flagged secrets (mark each as real or false positive)
+scripts/detect_secrets_baseline.sh audit
+
+# Manual check (same as the pre-commit hook)
+scripts/detect_secrets_baseline.sh
+```
 
 
 ### Packaging

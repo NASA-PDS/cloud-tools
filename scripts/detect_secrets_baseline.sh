@@ -1,33 +1,49 @@
 #!/bin/bash
 # Single source of truth for detect-secrets arguments.
+# Per-repo exclusions go in .detect-secrets-ignore (one regex per line, # for comments).
 #
 # Usage:
 #   scripts/detect_secrets_baseline.sh scan   # Regenerate .secrets.baseline
 #   scripts/detect_secrets_baseline.sh audit  # Interactively audit .secrets.baseline
 #   scripts/detect_secrets_baseline.sh        # Check for new secrets vs baseline
-#
 set -e
 
-DETECT_SECRETS_ARGS=(
-    --exclude-files '\.secrets..*'
-    --exclude-files '\.git.*'
-    --exclude-files '\.pre-commit-config\.yaml'
-    --exclude-files '\.mypy_cache'
-    --exclude-files '\.pytest_cache'
-    --exclude-files '\.tox'
-    --exclude-files '\.venv'
-    --exclude-files 'venv'
-    --exclude-files 'dist'
-    --exclude-files 'build'
-    --exclude-files '.*\.egg-info'
-    --exclude-files '.*/test/.*'
-    --exclude-files '.*/test/data/.*'
-    --exclude-files '.*/tests/data/.*'
-    --exclude-files '.*/test.*/data/.*'
-    --exclude-files '.*/.*test.*/data/.*'
-    --exclude-files 'src/.*/test/data/.*'
-    --exclude-files 'tests/data/.*'
+# Prefer venv's detect-secrets over system install
+if [ -f ".venv/bin/detect-secrets" ]; then
+    DETECT_SECRETS=".venv/bin/detect-secrets"
+else
+    DETECT_SECRETS="detect-secrets"
+fi
+
+# Global excludes applied in every repo
+GLOBAL_EXCLUDES=(
+    '\.secrets\..*'
+    '\.git.*'
+    '\.pre-commit-config\.yaml'
+    '\.mypy_cache'
+    '\.pytest_cache'
+    '\.tox'
+    '\.venv'
+    'venv'
+    'dist'
+    'build'
+    '.*\.egg-info'
+    'scripts/detect_secrets_baseline\.sh'
 )
+
+EXCLUDE_ARGS=()
+for pat in "${GLOBAL_EXCLUDES[@]}"; do
+    EXCLUDE_ARGS+=(--exclude-files "$pat")
+done
+
+# Per-repo excludes from .detect-secrets-ignore (one regex per line, # comments ok)
+if [ -f .detect-secrets-ignore ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        EXCLUDE_ARGS+=(--exclude-files "$line")
+    done < .detect-secrets-ignore
+fi
 
 compare_secrets() {
     diff \
@@ -47,11 +63,11 @@ print('\n'.join(sorted(lines)))
 }
 
 if [ "$1" = "scan" ]; then
-    detect-secrets scan "${DETECT_SECRETS_ARGS[@]}" > .secrets.baseline
+    $DETECT_SECRETS scan "${EXCLUDE_ARGS[@]}" > .secrets.baseline
     echo "Updated .secrets.baseline"
     echo "Next step: run 'scripts/detect_secrets_baseline.sh audit' to review and classify detected secrets."
 elif [ "$1" = "audit" ]; then
-    detect-secrets audit .secrets.baseline
+    $DETECT_SECRETS audit .secrets.baseline
 else
     # Check 1: Fail if any secrets in the baseline have not been audited
     unaudited=$(python3 -c "
@@ -69,7 +85,7 @@ print(count)
 
     # Check 2: Fail if any new secrets are detected that are not in the baseline
     cp .secrets.baseline .secrets.new
-    detect-secrets scan "${DETECT_SECRETS_ARGS[@]}" --baseline .secrets.new
+    $DETECT_SECRETS scan "${EXCLUDE_ARGS[@]}" --baseline .secrets.new
 
     if ! compare_secrets .secrets.baseline .secrets.new; then
         echo "⚠️ Attention Required! ⚠️" >&2
