@@ -13,7 +13,21 @@ Matching strategy:
     ETag equals the content MD5, so these two values are equivalent.  Multipart
     ETags (ending in -<N>) are excluded from this secondary index because they
     are not content MD5s.
-    Key names are intentionally ignored so renamed objects still count as present.
+    Size-confirmed match (weak fallback for multipart objects): OLD objects whose
+    only checksum is a multipart ETag (or an S3CMD-MD5 paired with a multipart ETag)
+    cannot be verified by checksum across migrations because:
+      - Multipart ETags are a hash-of-part-hashes that change when part boundaries
+        differ, even if the bytes are identical.
+      - S3CMD-MD5 metadata may not have been re-attached during server-side copy,
+        so a matching MD5 may not exist in the NEW manifest at all.
+    As a last resort these objects are matched by exact filename (basename of the
+    S3 key) AND byte-count against NEW objects.  A hit means a file with the
+    identical name and size exists in NEW, which is strong circumstantial evidence
+    the copy succeeded — especially for large files where a size collision is
+    astronomically unlikely.  Recorded with match_type ``SIZE_CONFIRMED``.
+    This is NOT a cryptographic content integrity check.
+    Key names are intentionally ignored for all other match types so renamed
+    objects still count as present.
 
 Multipart ETags:
     AWS S3 computes ETags differently for multipart uploads: the value is a hash
@@ -36,9 +50,8 @@ Output files:
         OLD-side rows that cannot be confirmed present in NEW for one of two
         reasons:
           (a) The row has no usable checksum at all (empty, ERROR:*, etc.).
-          (b) The row has a multipart ETag (value ends in -<N>), which changes
-              when objects are re-uploaded and therefore cannot reliably match
-              against the destination.
+          (b) The row has a multipart ETag (value ends in -<N>) AND no NEW
+              object of the same size was found (size-only fallback also failed).
         The ``reason`` column appended to each output row records which case
         applies: ``no_checksum`` or ``multipart_etag``.
         Action required: use a different verification method (e.g. byte-level
@@ -54,8 +67,15 @@ Output files:
           old_bucket, old_key, old_size, old_checksum_algorithm,
           old_checksum_type, old_checksum_value, old_etag,
           new_bucket, new_key, match_type
-        match_type is ``primary`` for native-checksum matches or ``etag_md5``
-        when an S3CMD-MD5 value was matched against the destination ETag.
+        match_type values:
+          ``CHECKSUM_VERIFIED`` — native (size, checksum_type, checksum_value) match;
+                                  content integrity cryptographically confirmed
+          ``ETAG_VERIFIED``     — S3CMD-MD5 value matched against destination ETag;
+                                  valid for single-part uploads where ETag == content MD5
+          ``SIZE_CONFIRMED``    — multipart-ETag object matched by exact filename + byte-count;
+                                  presence confirmed, content not cryptographically verified;
+                                  used when checksum comparison is impossible due to multipart
+                                  ETag instability or missing S3CMD-MD5 metadata in NEW
         Use this file as the definitive object-to-object migration inventory.
 
 Exit codes:
@@ -201,6 +221,17 @@ def _is_multipart_etag(row: Dict[str, str]) -> bool:
     return bool(_MULTIPART_ETAG_RE.match(value))
 
 
+def _has_multipart_etag(row: Dict[str, str]) -> bool:
+    """Return True if the row's *etag* field (not checksum_value) is a multipart ETag.
+
+    Used to detect rows where the checksum is an independent value (e.g. S3CMD-MD5)
+    but the underlying object was uploaded as multipart — meaning the ETag cannot be
+    used for cross-migration comparison, and a size-only fallback is appropriate.
+    """
+    etag = (row.get("etag") or "").strip().strip('"')
+    return bool(etag and _MULTIPART_ETAG_RE.match(etag))
+
+
 def _signature(row: Dict[str, str]) -> Tuple[str, str, str]:
     return (
         (row.get("size") or "").strip(),
@@ -237,6 +268,18 @@ def _build_new_index(
             new_bucket TEXT NOT NULL DEFAULT '',
             new_key TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (size, checksum_type, checksum_value)
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE new_sizes (
+            filename TEXT NOT NULL,
+            size TEXT NOT NULL,
+            cnt INTEGER NOT NULL DEFAULT 1,
+            new_bucket TEXT NOT NULL DEFAULT '',
+            new_key TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (filename, size)
         )
         """
     )
@@ -278,6 +321,19 @@ def _build_new_index(
                         " VALUES (?,?,?,?,?)",
                         (size_val, "MD5", etag, new_bucket, new_key),
                     )
+
+                # Filename+size index: fallback for multipart-ETag objects whose
+                # checksum cannot be compared across migrations. Keyed on
+                # (basename, size) so the match requires both an identical
+                # filename and identical byte-count — much stronger than size alone.
+                if size_val:
+                    filename = new_key.rsplit("/", 1)[-1] if "/" in new_key else new_key
+                    db.execute(
+                        "INSERT INTO new_sizes(filename, size, new_bucket, new_key)"
+                        " VALUES (?,?,?,?)"
+                        " ON CONFLICT(filename, size) DO UPDATE SET cnt = cnt + 1",
+                        (filename, size_val, new_bucket, new_key),
+                    )
             else:
                 assert weak_writer is not None
                 weak_writer.writerow(row)
@@ -314,8 +370,10 @@ def main() -> int:
         old_covered = 0
         missing_count = 0
         unverifiable_count = 0
-        multipart_etag_count = 0
+        unverifiable_no_checksum = 0
+        unverifiable_multipart = 0
         etag_md5_count = 0
+        size_only_count = 0
         old_bucket = "OLD"
         new_bucket = "NEW"
         old_fieldnames: Optional[list] = None
@@ -351,13 +409,47 @@ def main() -> int:
                     assert unver_writer is not None
                     unver_writer.writerow({**row, "reason": "no_checksum"})
                     unverifiable_count += 1
+                    unverifiable_no_checksum += 1
                     continue
 
                 if _is_multipart_etag(row):
-                    assert unver_writer is not None
-                    unver_writer.writerow({**row, "reason": "multipart_etag"})
-                    unverifiable_count += 1
-                    multipart_etag_count += 1
+                    size_val = (row.get("size") or "").strip()
+                    old_key = (row.get("key") or "").strip()
+                    filename = old_key.rsplit("/", 1)[-1] if "/" in old_key else old_key
+                    size_hit = None
+                    if size_val and filename:
+                        cur = db.execute(
+                            "SELECT cnt, new_bucket, new_key FROM new_sizes"
+                            " WHERE filename=? AND size=?",
+                            (filename, size_val),
+                        )
+                        size_hit = cur.fetchone()
+                    if size_hit:
+                        old_covered += 1
+                        size_only_count += 1
+                        _, hit_new_bucket, hit_new_key = size_hit
+                        if new_bucket == "NEW" and hit_new_bucket:
+                            new_bucket = hit_new_bucket
+                        algo = (row.get("checksum_algorithm") or "").strip()
+                        matched_writer.writerow(
+                            {
+                                "old_bucket": row.get("bucket", ""),
+                                "old_key": row.get("key", ""),
+                                "old_size": row.get("size", ""),
+                                "old_checksum_algorithm": algo,
+                                "old_checksum_type": row.get("checksum_type", ""),
+                                "old_checksum_value": row.get("checksum_value", ""),
+                                "old_etag": row.get("etag", ""),
+                                "new_bucket": hit_new_bucket,
+                                "new_key": hit_new_key,
+                                "match_type": "SIZE_CONFIRMED",
+                            }
+                        )
+                    else:
+                        assert unver_writer is not None
+                        unver_writer.writerow({**row, "reason": "multipart_etag"})
+                        unverifiable_count += 1
+                        unverifiable_multipart += 1
                     continue
 
                 sig = _signature(row)
@@ -373,8 +465,8 @@ def main() -> int:
                     if new_bucket == "NEW" and hit_new_bucket:
                         new_bucket = hit_new_bucket
                     algo = (row.get("checksum_algorithm") or "").strip()
-                    match_type = "etag_md5" if algo == "S3CMD-MD5" else "primary"
-                    if match_type == "etag_md5":
+                    match_type = "ETAG_VERIFIED" if algo == "S3CMD-MD5" else "CHECKSUM_VERIFIED"
+                    if match_type == "ETAG_VERIFIED":
                         etag_md5_count += 1
                     matched_writer.writerow(
                         {
@@ -391,6 +483,46 @@ def main() -> int:
                         }
                     )
                 else:
+                    # Checksum lookup failed. If the object's ETag reveals it was a
+                    # multipart upload, the S3CMD-MD5 checksum won't exist in NEW
+                    # (NEW was checksummed with CRC64NVME, not MD5). Try matching by
+                    # exact filename (basename) + size as a last resort before
+                    # declaring it missing. Identical filename + byte-count for large
+                    # objects is strong circumstantial evidence of a successful copy.
+                    if _has_multipart_etag(row):
+                        size_val = (row.get("size") or "").strip()
+                        old_key = (row.get("key") or "").strip()
+                        filename = old_key.rsplit("/", 1)[-1] if "/" in old_key else old_key
+                        size_hit = None
+                        if size_val and filename:
+                            cur = db.execute(
+                                "SELECT cnt, new_bucket, new_key FROM new_sizes"
+                                " WHERE filename=? AND size=?",
+                                (filename, size_val),
+                            )
+                            size_hit = cur.fetchone()
+                        if size_hit:
+                            old_covered += 1
+                            size_only_count += 1
+                            _, hit_new_bucket, hit_new_key = size_hit
+                            if new_bucket == "NEW" and hit_new_bucket:
+                                new_bucket = hit_new_bucket
+                            algo = (row.get("checksum_algorithm") or "").strip()
+                            matched_writer.writerow(
+                                {
+                                    "old_bucket": row.get("bucket", ""),
+                                    "old_key": row.get("key", ""),
+                                    "old_size": row.get("size", ""),
+                                    "old_checksum_algorithm": algo,
+                                    "old_checksum_type": row.get("checksum_type", ""),
+                                    "old_checksum_value": row.get("checksum_value", ""),
+                                    "old_etag": row.get("etag", ""),
+                                    "new_bucket": hit_new_bucket,
+                                    "new_key": hit_new_key,
+                                    "match_type": "SIZE_CONFIRMED",
+                                }
+                            )
+                            continue
                     assert miss_writer is not None
                     miss_writer.writerow(row)
                     missing_count += 1
@@ -412,12 +544,13 @@ def main() -> int:
     print()
     print(f"{old_bucket} objects total:                       {old_total:,}")
     print(f"{old_bucket} objects confirmed in {new_bucket}:  {old_covered:,}")
-    print(f"  of which matched by native checksum:            {old_covered - etag_md5_count:,}")
+    print(f"  of which matched by native checksum:            {old_covered - etag_md5_count - size_only_count:,}")
     print(f"  of which matched by ETag/MD5 cross-type:        {etag_md5_count:,}")
+    print(f"  of which matched by filename + size (weak):     {size_only_count:,}")
     print(f"{old_bucket} objects confirmed missing:           {missing_count:,}")
     print(f"{old_bucket} objects unable to verify (total):   {unverifiable_count:,}")
-    print(f"  of which multipart ETags:                       {multipart_etag_count:,}")
-    print(f"  of which no usable checksum:                    {unverifiable_count - multipart_etag_count:,}")
+    print(f"  of which multipart ETags (size match failed):   {unverifiable_multipart:,}")
+    print(f"  of which no usable checksum:                    {unverifiable_no_checksum:,}")
     print(f"{new_bucket} objects with weak checksum:          {weak_count:,}")
     print()
     print(f"Matched objects report:    {args.matched_output}")
@@ -429,9 +562,15 @@ def main() -> int:
     if success:
         print("RESULT: PASS")
         print(f"Every object in {old_bucket} with a stable checksum is confirmed present in {new_bucket}.")
-        if multipart_etag_count:
+        if size_only_count:
             print(
-                f"  Note: {multipart_etag_count:,} object(s) have multipart ETags and could not be verified by checksum."
+                f"  Note: {size_only_count:,} multipart-ETag object(s) confirmed by exact filename + byte-count "
+                f"(SIZE_CONFIRMED — existence confirmed, content not cryptographically verified)."
+            )
+        if unverifiable_multipart:
+            print(
+                f"  Note: {unverifiable_multipart:,} multipart-ETag object(s) could not be "
+                f"verified even by filename + size — no NEW object with matching name and size found."
             )
     else:
         print("RESULT: FAIL")
@@ -441,12 +580,10 @@ def main() -> int:
             )
         if unverifiable_count:
             print(f"  {unverifiable_count:,} object(s) from {old_bucket} could not be verified.")
-            if multipart_etag_count:
-                print(
-                    f"    {multipart_etag_count:,} have multipart ETags (ETag changes on re-upload; not a reliable match key)."
-                )
-            if unverifiable_count - multipart_etag_count:
-                print(f"    {unverifiable_count - multipart_etag_count:,} have no usable checksum at all.")
+            if unverifiable_multipart:
+                print(f"    {unverifiable_multipart:,} have multipart ETags with no filename+size match in NEW.")
+            if unverifiable_no_checksum:
+                print(f"    {unverifiable_no_checksum:,} have no usable checksum at all.")
 
     return 0 if success else 1
 

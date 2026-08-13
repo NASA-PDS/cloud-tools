@@ -69,6 +69,8 @@ from typing import List
 from typing import Optional
 from typing import Tuple
 
+import resource
+
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -138,6 +140,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-objects", type=int, default=None, help="Stop after N objects (smoke test)")
     p.add_argument("--dry-run", action="store_true", help="Print actions without executing them")
     p.add_argument(
+        "--retry-errors",
+        action="store_true",
+        help="Reset objects in 'error' state back to 'pending' so they are retried this run",
+    )
+    p.add_argument(
         "--restore-only",
         action="store_true",
         help="Submit Glacier restore requests and exit without copying (run again tomorrow to copy)",
@@ -154,6 +161,12 @@ def parse_args() -> argparse.Namespace:
         help="Logging verbosity (default: INFO)",
     )
     p.add_argument("--log-file", default=None, help="Write log output to this file in addition to stderr")
+    p.add_argument(
+        "--status-interval",
+        type=int,
+        default=60,
+        help="Seconds between periodic status log lines (default: 60; 0 to disable)",
+    )
     return p.parse_args()
 
 
@@ -222,6 +235,36 @@ def _set_state(conn: sqlite3.Connection, lock: threading.Lock, bucket: str, key:
 
 def _state_counts(conn: sqlite3.Connection) -> Dict[str, int]:
     return {row[0]: row[1] for row in conn.execute("SELECT state, COUNT(*) FROM objects GROUP BY state")}
+
+
+def _start_status_ticker(conn: sqlite3.Connection, interval: int, stop_evt: threading.Event) -> threading.Thread:
+    """Start a daemon thread that logs state counts every *interval* seconds."""
+    prev_done: List[int] = [0]
+    prev_time: List[float] = [time.monotonic()]
+
+    def _tick():
+        while not stop_evt.wait(interval):
+            c = _state_counts(conn)
+            now = time.monotonic()
+            done = c.get("done", 0)
+            elapsed = now - prev_time[0]
+            rate = (done - prev_done[0]) / elapsed if elapsed > 0 else 0.0
+            prev_done[0] = done
+            prev_time[0] = now
+            log.info(
+                "[status] done=%d  copying=%d  ready=%d  restoring=%d  pending=%d  error=%d  rate=%.1f obj/s",
+                done,
+                c.get("copying", 0),
+                c.get("ready", 0),
+                c.get("restoring", 0),
+                c.get("pending", 0),
+                c.get("error", 0),
+                rate,
+            )
+
+    t = threading.Thread(target=_tick, name="status-ticker", daemon=True)
+    t.start()
+    return t
 
 
 # ---------------------------------------------------------------------------
@@ -463,10 +506,27 @@ def _configure_logging(level: str, log_file: Optional[str]) -> None:
             logging.getLogger(name).setLevel(logging.WARNING)
 
 
+def _raise_fd_limit() -> None:
+    """Raise the open-file-descriptor limit to the OS hard cap.
+
+    High worker counts open many sockets + botocore data files concurrently.
+    macOS defaults to 256; we need far more for --workers > ~50.
+    """
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = min(hard, 65536)
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            log.debug("Raised RLIMIT_NOFILE: %d -> %d (hard cap: %d)", soft, target, hard)
+    except (ValueError, resource.error) as e:
+        log.warning("Could not raise file descriptor limit: %s", e)
+
+
 def main() -> int:
     """Two-phase Glacier restore + cross-region S3 copy."""
     args = parse_args()
     _configure_logging(args.log_level, args.log_file)
+    _raise_fd_limit()
 
     src_session = _build_session(args.source_profile, args.source_region)
     dst_session = _build_session(args.dest_profile or args.source_profile, args.dest_region)
@@ -489,6 +549,9 @@ def main() -> int:
     # Reset any mid-copy state from a previous crashed run so they get re-checked
     with db_lock:
         conn.execute("UPDATE objects SET state='restoring' WHERE state='copying'")
+        if args.retry_errors:
+            retried = conn.execute("UPDATE objects SET state='pending', error=NULL WHERE state='error'").rowcount
+            log.info("--retry-errors: reset %d error objects back to 'pending'", retried)
         conn.commit()
 
     # Load manifest, inserting rows that aren't already in the DB
@@ -500,7 +563,7 @@ def main() -> int:
     if any(counts.values()):
         log.info("Prior run state (from %s): %s", args.state_db, counts)
         if prior_errors:
-            log.info("  (%d objects in 'error' state from a previous run — will not be retried)", prior_errors)
+            log.info("  (%d objects in 'error' state from a previous run — use --retry-errors to retry them)", prior_errors)
     else:
         log.info("State DB is empty — starting fresh.")
 
@@ -509,6 +572,19 @@ def main() -> int:
     # -----------------------------------------------------------------------
     if args.copy_only:
         log.info("--copy-only: skipping restore submission, going straight to copy phase.")
+        with db_lock:
+            promoted = conn.execute("UPDATE objects SET state='restoring' WHERE state='pending'").rowcount
+            conn.commit()
+        if promoted:
+            log.info(
+                "--copy-only: promoted %d pending objects to 'restoring' — poll loop will check actual restore status",
+                promoted,
+            )
+
+    stop_ticker = threading.Event()
+    if args.status_interval > 0:
+        _start_status_ticker(conn, args.status_interval, stop_ticker)
+        log.info("Status ticker started (every %ds). Use --status-interval 0 to disable.", args.status_interval)
 
     pending = conn.execute("SELECT bucket, key FROM objects WHERE state='pending'").fetchall() if not args.copy_only else []
     error_count_p1 = 0
@@ -537,7 +613,7 @@ def main() -> int:
                     error_count_p1 += 1
                     log.error("Restore failed s3://%s/%s: %s", bucket, key, err)
                 submitted_total = submitted + ready_direct + error_count_p1
-                if submitted_total in {1, 10, 100} or (submitted_total > 0 and submitted_total % 5000 == 0):
+                if submitted_total in {1, 10, 100} or (submitted_total > 0 and submitted_total % 1000 == 0):
                     log.info(
                         "Phase 1 progress: %d processed (%d immediate, %d restoring, %d errors)",
                         submitted_total, ready_direct, submitted, error_count_p1,
@@ -578,73 +654,101 @@ def main() -> int:
                     fut.result()
                     _set_state(conn, db_lock, bucket, key, "done")
                     done_count += 1
-                    if done_count in {1, 10, 100} or done_count % 1000 == 0:
-                        log.info("Phase 2 progress: %d objects copied so far", done_count)
+                    if done_count in {1, 10, 100} or done_count % 250 == 0:
+                        log.info("Phase 2 progress: %d objects copied so far (%d errors)", done_count, error_count)
                 except Exception as e:
                     _set_state(conn, db_lock, bucket, key, "error", str(e))
                     error_count += 1
                     log.error("Copy failed s3://%s/%s: %s", bucket, key, e)
 
-        while True:
-            _drain_completed()
+        sweep = 0
+        interrupted = False
+        try:
+            while True:
+                sweep += 1
+                _drain_completed()
 
-            # Promote any restoring objects that are now available
-            restoring_rows = conn.execute(
-                "SELECT bucket, key FROM objects WHERE state='restoring' LIMIT ?", (poll_batch,)
-            ).fetchall()
-
-            newly_ready = 0
-            if restoring_rows:
-                def _check_one(row: Tuple[str, str]) -> Tuple[str, str, str]:
-                    bucket, key = row
-                    try:
-                        status = _check_restore_status(src_session, bucket, key)
-                        return bucket, key, status
-                    except Exception:
-                        return bucket, key, "restoring"  # retry next sweep
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.workers, 32)) as poll_pool:
-                    for bucket, key, status in poll_pool.map(_check_one, restoring_rows):
-                        if status == "ready":
-                            _set_state(conn, db_lock, bucket, key, "ready")
-                            newly_ready += 1
-
-            # Dispatch ready objects to copy workers (respect queue cap)
-            while len(in_flight) < copy_queue_size:
-                rows = conn.execute(
-                    "SELECT bucket, key, size FROM objects WHERE state='ready' LIMIT ?",
-                    (copy_queue_size - len(in_flight),),
+                # Promote any restoring objects that are now available
+                restoring_rows = conn.execute(
+                    "SELECT bucket, key FROM objects WHERE state='restoring' LIMIT ?", (poll_batch,)
                 ).fetchall()
-                if not rows:
-                    break
-                for bucket, key, size in rows:
-                    _set_state(conn, db_lock, bucket, key, "copying")
-                    dst_key = args.dest_prefix + key if args.dest_prefix else key
-                    fut = executor.submit(
-                        _do_copy,
-                        src_session, dst_session,
-                        bucket, key,
-                        args.dest_bucket, dst_key,
-                        size,
-                        args.storage_class,
-                        args.multipart_threshold,
-                        args.part_size,
-                        args.dry_run,
+
+                newly_ready = 0
+                if restoring_rows:
+                    def _check_one(row: Tuple[str, str]) -> Tuple[str, str, str]:
+                        bucket, key = row
+                        try:
+                            status = _check_restore_status(src_session, bucket, key)
+                            return bucket, key, status
+                        except Exception:
+                            return bucket, key, "restoring"  # retry next sweep
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.workers, 32)) as poll_pool:
+                        for bucket, key, status in poll_pool.map(_check_one, restoring_rows):
+                            if status == "ready":
+                                _set_state(conn, db_lock, bucket, key, "ready")
+                                newly_ready += 1
+
+                    log.info(
+                        "Sweep %d: polled %d restoring objects — %d newly ready, %d still restoring",
+                        sweep, len(restoring_rows), newly_ready, len(restoring_rows) - newly_ready,
                     )
-                    in_flight[fut] = (bucket, key)
 
-            # Check termination condition
-            c = _state_counts(conn)
-            remaining = c.get("pending", 0) + c.get("restoring", 0) + c.get("ready", 0) + c.get("copying", 0) + len(in_flight)
-            if remaining == 0:
-                break
+                # Dispatch ready objects to copy workers (respect queue cap)
+                dispatched = 0
+                while len(in_flight) < copy_queue_size:
+                    rows = conn.execute(
+                        "SELECT bucket, key, size FROM objects WHERE state='ready' LIMIT ?",
+                        (copy_queue_size - len(in_flight),),
+                    ).fetchall()
+                    if not rows:
+                        break
+                    for bucket, key, size in rows:
+                        _set_state(conn, db_lock, bucket, key, "copying")
+                        dst_key = args.dest_prefix + key if args.dest_prefix else key
+                        fut = executor.submit(
+                            _do_copy,
+                            src_session, dst_session,
+                            bucket, key,
+                            args.dest_bucket, dst_key,
+                            size,
+                            args.storage_class,
+                            args.multipart_threshold,
+                            args.part_size,
+                            args.dry_run,
+                        )
+                        in_flight[fut] = (bucket, key)
+                        dispatched += 1
 
-            # If nothing moved this sweep, sleep before next poll
-            if newly_ready == 0 and not [f for f in in_flight if f.done()]:
-                restoring_left = c.get("restoring", 0)
-                if restoring_left:
-                    log.info("%d objects still restoring — sleeping %ds...", restoring_left, args.poll_interval)
-                    time.sleep(args.poll_interval)
+                if dispatched:
+                    log.info("Sweep %d: dispatched %d objects to copy workers (%d in-flight)", sweep, dispatched, len(in_flight))
+
+                # Check termination condition
+                c = _state_counts(conn)
+                remaining = c.get("pending", 0) + c.get("restoring", 0) + c.get("ready", 0) + c.get("copying", 0) + len(in_flight)
+                if remaining == 0:
+                    break
+
+                # Only sleep when there is truly nothing to do: no copies in-flight,
+                # no objects ready to dispatch, and Glacier restores are still pending.
+                # Never sleep while ready objects are waiting — that stalls copying.
+                if newly_ready == 0 and not in_flight and c.get("ready", 0) == 0:
+                    restoring_left = c.get("restoring", 0)
+                    if restoring_left:
+                        log.info(
+                            "Sweep %d: %d restoring, nothing in-flight — sleeping %ds before next poll...",
+                            sweep, restoring_left, args.poll_interval,
+                        )
+                        try:
+                            time.sleep(args.poll_interval)
+                        except KeyboardInterrupt:
+                            log.info("Interrupted during poll sleep — stopping after in-flight copies finish.")
+                            interrupted = True
+                            break
+
+        except KeyboardInterrupt:
+            log.info("Interrupted — waiting for %d in-flight copies to finish before exiting...", len(in_flight))
+            interrupted = True
 
         # Final drain
         for fut in concurrent.futures.as_completed(list(in_flight.keys())):
@@ -658,15 +762,19 @@ def main() -> int:
                 error_count += 1
                 log.error("Copy failed s3://%s/%s: %s", bucket, key, e)
 
+    stop_ticker.set()
+
     # -----------------------------------------------------------------------
     # Summary
     # -----------------------------------------------------------------------
     final = _state_counts(conn)
-    log.info("=== Copy Summary ===")
+    log.info("=== Copy Summary%s ===", " (interrupted)" if interrupted else "")
     log.info("Done:      %d", final.get("done", 0))
     log.info("Errors:    %d", final.get("error", 0))
     log.info("Restoring: %d  (re-run to continue)", final.get("restoring", 0))
     log.info("Remaining: %d", final.get("pending", 0) + final.get("ready", 0))
+    if interrupted:
+        log.info("Re-run with --copy-only to resume from where this left off.")
 
     if final.get("error", 0):
         log.warning("Re-query errors: SELECT key, error FROM objects WHERE state='error';")

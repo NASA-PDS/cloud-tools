@@ -9,6 +9,11 @@ Checksum resolution order (first match wins):
 Output CSV columns:
   bucket, key, size, checksum_algorithm, checksum_type, checksum_value, etag
 
+A progress DB is always maintained at <output>.db alongside the CSV.  On the
+next run the DB is loaded automatically — already-processed keys are skipped
+without re-reading the CSV.  If the DB does not exist yet, pass --resume-from
+<manifest.csv> to seed it from an existing CSV on the first resume.
+
 Usage:
   pdc-build-checksum-manifest --bucket my-bucket --output manifest.csv
 
@@ -16,7 +21,8 @@ Optional:
   --prefix PDS4/
   --profile my-aws-profile
   --region us-west-2
-  --resume-from manifest.csv   # resume an interrupted run (same file as --output)
+  --resume-from manifest.csv   # seed the DB from a CSV (only needed when no .db exists yet)
+  --keys-from weak_checksum_rows.csv  # re-fetch only the keys listed in this CSV
   --max-objects 1000           # stop after N objects (dry run / smoke test)
   --workers 32                 # parallel threads for checksum fetching (default: 32)
 """
@@ -28,7 +34,6 @@ import csv
 import os
 import sqlite3
 import sys
-import tempfile
 import threading
 import time
 from typing import Dict
@@ -83,6 +88,11 @@ def parse_args() -> argparse.Namespace:
         help="Stop after processing this many objects (useful for dry runs)",
     )
     parser.add_argument(
+        "--keys-from",
+        default=None,
+        help="CSV file containing a 'key' column; process only those keys instead of listing the bucket",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=32,
@@ -112,42 +122,58 @@ def get_thread_s3_client(session: boto3.Session):
     return _thread_local.s3_client
 
 
-def build_resume_db(csv_path: str) -> Tuple[sqlite3.Connection, str]:
-    """Load already-processed keys from a resume CSV into a temp SQLite DB.
+def open_or_create_db(db_path: str) -> Tuple[sqlite3.Connection, int]:
+    """Open the persistent progress DB, creating it if absent.
 
-    Uses disk-based SQLite to avoid holding 26M+ strings in RAM.
-    Returns (connection, db_path); caller must close and delete db_path.
+    Returns (connection, existing_key_count).
     """
-    db_fd, db_path = tempfile.mkstemp(suffix=".db", prefix="pdc_resume_")
-    os.close(db_fd)
+    already_existed = os.path.exists(db_path)
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=OFF")
-    conn.execute("PRAGMA synchronous=OFF")
-    conn.execute("CREATE TABLE processed_keys (key TEXT NOT NULL PRIMARY KEY)")
-
-    batch: List[Tuple[str, ...]] = []
-    batch_size = 100_000
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("CREATE TABLE IF NOT EXISTS processed_keys (key TEXT NOT NULL PRIMARY KEY)")
+    conn.commit()
     count = 0
+    if already_existed:
+        count = conn.execute("SELECT COUNT(*) FROM processed_keys").fetchone()[0]
+    return conn, count
+
+
+def seed_db_from_csv(conn: sqlite3.Connection, csv_path: str) -> int:
+    """Insert keys from an existing manifest CSV into the progress DB.
+
+    Skips keys already present.  Returns the number of newly inserted rows.
+    Commits each batch so progress is preserved on KeyboardInterrupt.
+    """
+    batch: List[Tuple[str, ...]] = []
+    batch_size = 500_000
+    rows_read = 0
     with open(csv_path, "r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             batch.append((row["key"],))
+            rows_read += 1
             if len(batch) >= batch_size:
                 conn.executemany("INSERT OR IGNORE INTO processed_keys VALUES (?)", batch)
-                count += len(batch)
+                conn.commit()
                 batch.clear()
-                print(f"  Loaded {count} keys...", file=sys.stderr)
+                print(f"  Seeded {rows_read:,} rows from CSV...", file=sys.stderr)
     if batch:
         conn.executemany("INSERT OR IGNORE INTO processed_keys VALUES (?)", batch)
-        count += len(batch)
-    conn.commit()
-    print(f"  Loaded {count} keys into SQLite index ({db_path}).", file=sys.stderr)
-    return conn, db_path
+        conn.commit()
+    return rows_read
 
 
 def key_is_processed(conn: sqlite3.Connection, key: str) -> bool:
     """Return True if key exists in the SQLite processed-keys table."""
     return conn.execute("SELECT 1 FROM processed_keys WHERE key = ?", (key,)).fetchone() is not None
+
+
+def mark_key_processed(conn: sqlite3.Connection, key: str, count: int) -> None:
+    """Insert a key into the progress DB; commit every 1000 rows."""
+    conn.execute("INSERT OR IGNORE INTO processed_keys VALUES (?)", (key,))
+    if count % 1_000 == 0:
+        conn.commit()
 
 
 def choose_checksum(resp: Dict) -> Tuple[str, str, str]:
@@ -164,6 +190,21 @@ def choose_checksum(resp: Dict) -> Tuple[str, str, str]:
             return algo_name, checksum_type, value
 
     return "", checksum_type, ""
+
+
+def iter_keys_from_csv(csv_path: str) -> Iterable[Dict]:
+    """Yield minimal object dicts (key, size) from a manifest-style CSV.
+
+    The CSV must have a 'key' column; 'size' is used if present.
+    """
+    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            key = (row.get("key") or "").strip()
+            if not key:
+                continue
+            size = (row.get("size") or "").strip()
+            yield {"Key": key, "Size": size}
 
 
 def list_objects(s3_client, bucket: str, prefix: str) -> Iterable[Dict]:
@@ -282,25 +323,44 @@ def main() -> int:
         config=Config(retries={"max_attempts": 10, "mode": "standard"}),
     )
 
-    resume_conn: Optional[sqlite3.Connection] = None
-    resume_db_path: Optional[str] = None
-    write_header = True
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
 
+    db_path = args.output + ".db"
+    resume_conn, existing_count = open_or_create_db(db_path)
+
+    write_header = True
     mode = "w"
-    if args.resume_from:
-        print(f"Loading existing keys from {args.resume_from}...", file=sys.stderr)
-        resume_conn, resume_db_path = build_resume_db(args.resume_from)
-        print("Resume index ready. Will skip already-processed keys.", file=sys.stderr)
+
+    if existing_count > 0:
+        print(
+            f"WARNING: Progress DB found at {db_path} with {existing_count:,} already-processed keys. "
+            "Continuing from DB — pass a fresh --output path to start over.",
+            file=sys.stderr,
+        )
         mode = "a"
         write_header = False
 
     prefix_str = args.prefix or "(none)"
-    print(f"Listing objects in s3://{args.bucket} prefix={prefix_str} ...", file=sys.stderr)
 
     # At most workers*4 futures in-flight to bound memory for very large buckets.
     max_pending = args.workers * 4
 
+    interrupted = False
     try:
+        if existing_count == 0 and args.resume_from:
+            print(f"Seeding progress DB from {args.resume_from}...", file=sys.stderr)
+            seeded = seed_db_from_csv(resume_conn, args.resume_from)
+            print(f"Seeded {seeded:,} rows into {db_path}. Will skip already-processed keys.", file=sys.stderr)
+            mode = "a"
+            write_header = False
+
+        if args.keys_from:
+            print(f"Reading keys from {args.keys_from} (skipping bucket listing)...", file=sys.stderr)
+            object_source = iter_keys_from_csv(args.keys_from)
+        else:
+            print(f"Listing objects in s3://{args.bucket} prefix={prefix_str} ...", file=sys.stderr)
+            object_source = list_objects(list_client, args.bucket, args.prefix)
+
         with open(args.output, mode, newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             if write_header:
@@ -326,64 +386,97 @@ def main() -> int:
                     print(f"Processed {count} new objects{scanned_str}...", file=sys.stderr)
 
             def write_row(fut: concurrent.futures.Future) -> None:
-                """Write a completed future's result to CSV and update count."""
+                """Write a completed future's result to CSV and record key in DB."""
                 nonlocal count
-                writer.writerow(fut.result())
+                row = fut.result()
+                writer.writerow(row)
                 count += 1
+                mark_key_processed(resume_conn, row[1], count)  # row[1] == key
                 log_progress()
-                # Flush periodically so --resume-from can recover a partial run.
+                # Flush CSV periodically so the output stays recoverable on interruption.
                 if count % 10_000 == 0:
                     f.flush()
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
                 pending: Dict[concurrent.futures.Future, None] = {}
 
-                for obj in list_objects(list_client, args.bucket, args.prefix):
-                    key = obj["Key"]
-                    if resume_conn and key_is_processed(resume_conn, key):
-                        skipped += 1
-                        continue
+                try:
+                    for obj in object_source:
+                        key = obj["Key"]
+                        if resume_conn and key_is_processed(resume_conn, key):
+                            skipped += 1
+                            continue
 
-                    if args.max_objects and submitted >= args.max_objects:
-                        break
+                        if args.max_objects and submitted >= args.max_objects:
+                            break
 
-                    # Block until the queue drains below the cap.
-                    while len(pending) >= max_pending:
-                        done, _ = concurrent.futures.wait(
-                            pending.keys(), return_when=concurrent.futures.FIRST_COMPLETED
-                        )
-                        for fut in done:
+                        # Block until the queue drains below the cap.
+                        while len(pending) >= max_pending:
+                            done, _ = concurrent.futures.wait(
+                                pending.keys(), return_when=concurrent.futures.FIRST_COMPLETED
+                            )
+                            for fut in done:
+                                write_row(fut)
+                                del pending[fut]
+
+                        # Opportunistically drain any already-finished futures.
+                        for fut in [f for f in pending if f.done()]:
                             write_row(fut)
                             del pending[fut]
 
-                    # Opportunistically drain any already-finished futures.
-                    for fut in [f for f in pending if f.done()]:
+                        pending[
+                            executor.submit(process_object, session, args.bucket, key, obj.get("Size", ""))
+                        ] = None
+                        submitted += 1
+
+                        if submitted == 1:
+                            print("First object submitted, fetching checksums...", file=sys.stderr)
+
+                    # Drain all remaining in-flight futures.
+                    for fut in concurrent.futures.as_completed(list(pending.keys())):
                         write_row(fut)
-                        del pending[fut]
 
-                    pending[executor.submit(process_object, session, args.bucket, key, obj.get("Size", ""))] = None
-                    submitted += 1
+                except KeyboardInterrupt:
+                    interrupted = True
+                    print(
+                        "\nInterrupted. Cancelling queued work and draining in-flight requests...",
+                        file=sys.stderr,
+                    )
+                    # Cancel futures that haven't started yet.
+                    for fut in list(pending.keys()):
+                        fut.cancel()
+                    # Drain futures that are already running so the output stays valid.
+                    for fut in concurrent.futures.as_completed(list(pending.keys())):
+                        if not fut.cancelled():
+                            write_row(fut)
 
-                    if submitted == 1:
-                        print("First object submitted, fetching checksums...", file=sys.stderr)
+            f.flush()
 
-                # Drain all remaining in-flight futures.
-                for fut in concurrent.futures.as_completed(list(pending.keys())):
-                    write_row(fut)
-
-        skipped_str = f", skipped {skipped} already-processed" if skipped else ""
+        if interrupted:
+            print(
+                f"Interrupted after {count} new objects (output preserved at {args.output}). "
+                f"Progress DB saved to {db_path} — re-run with the same --output to continue.",
+                file=sys.stderr,
+            )
+        else:
+            skipped_str = f", skipped {skipped} already-processed" if skipped else ""
+            print(
+                f"Done. Processed {count} new objects{skipped_str} ({count + skipped} total scanned). "
+                f"Manifest written to {args.output}",
+                file=sys.stderr,
+            )
+    except KeyboardInterrupt:
+        interrupted = True
         print(
-            f"Done. Processed {count} new objects{skipped_str} ({count + skipped} total scanned). "
-            f"Manifest written to {args.output}",
+            f"\nInterrupted during seeding. Progress DB saved to {db_path} — "
+            "re-run with the same arguments to continue seeding.",
             file=sys.stderr,
         )
     finally:
-        if resume_conn:
-            resume_conn.close()
-        if resume_db_path and os.path.exists(resume_db_path):
-            os.unlink(resume_db_path)
+        resume_conn.commit()
+        resume_conn.close()
 
-    return 0
+    return 1 if interrupted else 0
 
 
 if __name__ == "__main__":

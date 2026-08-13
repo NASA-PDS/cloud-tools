@@ -54,7 +54,16 @@ The source lives under `src/pds/pdc/` using PDS namespace packaging. CLI entry p
 
 - **`data_integrity/`** — Data integrity verification for cloud migrations:
   - `build_s3_checksum_manifest.py` — Generates a CSV manifest of S3 objects with checksums (prefers CRC64NVME, falls back to others). Supports `--resume-from` for incremental runs. Outputs: `bucket, key, size, checksum_algorithm, checksum_type, checksum_value, etag`.
-  - `compare_s3_manifests.py` — Compares two manifests by matching `(size, checksum_type, checksum_value)` tuples. Identifies objects in OLD manifest missing from NEW, and flags weak checksums. Returns exit code 1 if any OLD objects are unmatched.
+  - `compare_s3_manifests.py` — Compares two manifests to verify every object in OLD is present in NEW. Uses a tiered matching strategy (see below). Returns exit code 1 if any OLD objects are unmatched with a stable checksum.
+
+    **Matching tiers (in priority order):**
+    1. `CHECKSUM_VERIFIED` — primary match on `(size, checksum_type, checksum_value)`; cryptographic content proof.
+    2. `ETAG_VERIFIED` — cross-type match: OLD object has S3CMD-MD5 metadata checksum, matched against NEW object's ETag. Valid only for single-part uploads where ETag == content MD5.
+    3. `SIZE_CONFIRMED` — weak fallback for multipart-ETag objects where no stable checksum exists for cross-migration comparison. Matches on exact filename (basename of S3 key) + byte-count. Used when: (a) OLD `checksum_value` is a multipart ETag (`<hex>-<N>`), or (b) OLD has an S3CMD-MD5 checksum but its ETag is multipart, meaning the MD5 was likely not re-attached during server-side copy and won't appear in NEW's manifest. Identical filename + size for large objects is strong circumstantial evidence of a successful copy, but is not a cryptographic integrity guarantee.
+
+    **Why multipart ETags break checksum comparison:** AWS computes multipart ETags as a hash-of-part-hashes suffixed with the part count. If an object is re-uploaded or server-side copied with different part boundaries, the ETag changes even if the bytes are identical. This makes them useless as cross-migration identifiers.
+
+    **Output files:** `matched_objects.csv` (with `match_type` column), `missing_in_new.csv`, `unverifiable.csv` (with `reason` column: `no_checksum` or `multipart_etag`), `weak_checksum_rows.csv`.
 
 ## CI/CD
 
