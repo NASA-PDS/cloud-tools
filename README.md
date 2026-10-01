@@ -213,6 +213,88 @@ The resume run appends new rows to the existing CSV and skips any key already re
 - Matching is by content signature `(size, checksum_type, checksum_value)`, not by key. An object that was renamed or moved but has identical content will be counted as covered.
 
 
+## CloudFront Log Sync (`sync_cloudfront_logs.sh`)
+
+Copies CloudFront access logs from a source S3 bucket to a destination S3 bucket, downloading them locally as a staging step. Designed for cases where the two buckets live in **different AWS accounts**, making direct server-side copy impossible — you must authenticate to each account separately.
+
+### Prerequisites: AWS credentials for both accounts
+
+Before running the script, ensure your `~/.aws/credentials` (or `~/.aws/config`) has named profiles for both the source and destination accounts:
+
+```ini
+# ~/.aws/credentials
+[<src-profile>]
+aws_access_key_id     = AKIA...
+aws_secret_access_key = ...
+
+[<dst-profile>]
+aws_access_key_id     = AKIA...
+aws_secret_access_key = ...
+```
+
+Or using role assumption (no long-lived keys):
+
+```ini
+# ~/.aws/config
+[profile <src-profile>]
+role_arn       = arn:aws:iam::<src-account-id>:role/<RoleName>
+source_profile = <base-profile>
+region         = us-west-2
+
+[profile <dst-profile>]
+role_arn       = arn:aws:iam::<dst-account-id>:role/<RoleName>
+source_profile = <base-profile>
+region         = us-west-2
+```
+
+Verify access before running:
+
+```bash
+aws s3 ls s3://<src-bucket>/ --profile <src-profile>
+aws s3 ls s3://<dst-bucket>/ --profile <dst-profile>
+```
+
+### Basic usage
+
+```bash
+# Sync a specific year/month using the default buckets and profiles
+scripts/sync_cloudfront_logs.sh <year> <month>
+
+# Override buckets and profiles explicitly
+scripts/sync_cloudfront_logs.sh <year> <month> \
+  --src-bucket <src-bucket> --src-profile <src-profile> \
+  --dst-bucket <dst-bucket> --dst-profile <dst-profile>
+```
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--src-bucket <bucket>` | `pds-logs-prod` | Source S3 bucket |
+| `--dst-bucket <bucket>` | `pds-logs-dev` | Destination S3 bucket |
+| `--src-profile <profile>` | `prod-en-platform-engineer` | AWS profile for the source account |
+| `--dst-profile <profile>` | `dev-power` | AWS profile for the destination account |
+| `--prefix <prefix>` | `pdc-cds-infra/cloudfront/access/json/pds-main` | Key prefix up to the `year=` segment |
+| `--scratch-dir <dir>` | `/tmp/cloudfront-sync-<year>-<month>` | Local staging directory |
+| `--keep-scratch` | _(delete after upload)_ | Keep the local scratch directory when done |
+
+The script resolves the full S3 prefix as `<prefix>/year=<year>/month=<month>/` and syncs that exact partition.
+
+### What the script does
+
+1. **Download** — `aws s3 sync` pulls all objects under the prefix from the source bucket into a local scratch directory, using the source profile.
+2. **Upload** — `aws s3 sync` pushes those files to the same prefix in the destination bucket, using the destination profile.
+3. **Verify** — lists the destination bucket and confirms every downloaded file is present; exits with code `1` and prints the missing keys if any are absent.
+4. **Cleanup** — removes the scratch directory unless `--keep-scratch` was passed.
+
+### Example
+
+```bash
+# Sync August 2026 logs, keep scratch directory for inspection
+scripts/sync_cloudfront_logs.sh 2026 08 --keep-scratch
+```
+
+
 ## Code of Conduct
 
 All users and developers of the NASA-PDS software are expected to abide by our [Code of Conduct](https://github.com/NASA-PDS/.github/blob/main/CODE_OF_CONDUCT.md). Please read this to ensure you understand the expectations of our community.
