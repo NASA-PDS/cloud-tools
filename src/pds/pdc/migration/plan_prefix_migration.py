@@ -1034,12 +1034,17 @@ def select_families(
         select_all: True for ``--all``.
         exclude: Families to leave out (``--exclude-family``), for example ones already migrated.
 
+    An excluded family with no prefixes left under PDS4/ (already migrated and deleted) is only reported.
+
     Raises:
-        MigrationPlanError: if a named or excluded family has no prefixes under PDS4/.
+        MigrationPlanError: if a family named with ``--family`` has no prefixes under PDS4/.
     """
-    unknown = [f for f in [*(families or []), *exclude] if f not in available]
+    unknown = [f for f in families or [] if f not in available]
     if unknown:
         raise MigrationPlanError(f"No prefixes found for family: {', '.join(unknown)}")
+    absent = [f for f in exclude if f not in available]
+    if absent:
+        log.warning("Excluded families with no prefixes under PDS4/ (ignored): %s", ", ".join(absent))
     wanted = sorted(available) if select_all else list(families or [])
     return [f for f in wanted if f not in set(exclude)]
 

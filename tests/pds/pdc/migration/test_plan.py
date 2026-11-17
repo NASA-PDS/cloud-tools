@@ -513,8 +513,10 @@ def test_select_families_for_all_can_leave_out_the_ones_already_migrated():
 def test_select_families_rejects_unknown_names():
     with pytest.raises(MigrationPlanError):
         select_families(AVAILABLE, ["Nope"], False, [])
-    with pytest.raises(MigrationPlanError):
-        select_families(AVAILABLE, None, True, ["Nope"])
+
+
+def test_select_families_ignores_an_excluded_family_that_is_already_gone():
+    assert select_families(AVAILABLE, None, True, ["Nope", "MAVEN"]) == ["Huygens", "LADEE", "PHX"]
 
 
 def test_is_listed_covers_descendants_of_listed_prefixes():
