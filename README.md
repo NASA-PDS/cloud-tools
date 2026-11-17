@@ -213,6 +213,104 @@ The resume run appends new rows to the existing CSV and skips any key already re
 - Matching is by content signature `(size, checksum_type, checksum_value)`, not by key. An object that was renamed or moved but has identical content will be counted as covered.
 
 
+## Prefix Migration (`PDS4/` to `pds4/`)
+
+These tools rename every object under `PDS4/` to `pds4/` and consolidate each family of versioned prefixes (for example `MAVEN`, `MAVEN11` ... `MAVEN43`) into a single prefix. Copies happen inside the bucket (server side), every copy is verified, and the sources are deleted only afterwards.
+
+| Command | Purpose |
+|---------|---------|
+| `pdc-plan-prefix-migration` | Read-only. Lists the objects and writes a plan CSV that says what happens to each one |
+| `pdc-execute-prefix-migration` | Copies the objects in a plan to their new keys, then verifies each copy |
+| `pdc-delete-migrated-sources` | Deletes the source objects whose content is safely kept elsewhere |
+
+The commands are registered by the package install; `python3 -m pds.pdc.migration.<module>` works as well (`plan_prefix_migration`, `execute_prefix_migration`, `delete_migrated_sources`).
+
+### What happens to each object
+
+A *family* is a base prefix plus its numbered or `v<N>` prefixes (`MAVEN`, `InSight`, `Mars2020`, `juno_jiram_bundle` ...). A prefix that is not part of a family is only renamed from `PDS4/` to `pds4/`.
+
+| Action | Meaning |
+|--------|---------|
+| `MOVE` | Copied to `pds4/<family>/<path>`. The newest version of a key, or an object nothing else collides with |
+| `RENAME` | An older version with a different PDS4 `version_id`, kept beside the newest as `<name>_v<version_id>.<ext>` |
+| `GARBAGE` | Copied to `potential-garbage/<prefix>/<path>`: older versions with the same `version_id` as the newest (in-place updates) and directories set aside for review |
+| `SUPERSEDE` | Copied to `pds4/superseded/<prefix>/<path>`: an older version with no label or no `version_id`, or one whose renamed key is taken |
+| `DROP` | Byte-identical to an object that is kept; the source is deleted and nothing is copied |
+| `JUNK` | `.DS_Store`, `._*` and `.*.swp` files; the source is deleted and nothing is copied |
+| `REVIEW` | Colliding objects with no `mtime`; written to the review CSV and left untouched |
+
+When several objects map to the same new key, the newest one wins. "Newest" is the `mtime` in the `s3cmd-attrs` user metadata, never the S3 last-modified time. Two objects are identical only when their sizes match and their single-part ETag or CRC64NVME checksum agrees. Older versions are classified by the `<version_id>` in the object's PDS4 label: the object itself for an `.xml` file, the same-named `.xml` for a data file, or a label in the same directory whose `<file_name>` names the file.
+
+### Workflow
+
+```bash
+BUCKET="<your-bucket>"
+AWS_PROFILE_NAME="<your-aws-profile>"
+FAMILY="<family-name>"
+WORKDIR="<a-folder-with-free-space>"
+PLAN="${WORKDIR}/plan_${FAMILY}.csv"
+
+# 1. Plan (read-only). Writes ${PLAN}, ${PLAN%.csv}_review.csv and ${PLAN}.db
+pdc-plan-prefix-migration --bucket "${BUCKET}" --profile "${AWS_PROFILE_NAME}" --family "${FAMILY}" --output "${PLAN}"
+
+# 2. Look at what would be copied (writes nothing), then copy and verify
+pdc-execute-prefix-migration --bucket "${BUCKET}" --profile "${AWS_PROFILE_NAME}" --plan "${PLAN}" --dry-run
+pdc-execute-prefix-migration --bucket "${BUCKET}" --profile "${AWS_PROFILE_NAME}" --plan "${PLAN}" --execute
+
+# 3. Look at what would be deleted, delete a small slice, then the rest
+pdc-delete-migrated-sources --bucket "${BUCKET}" --profile "${AWS_PROFILE_NAME}" --plan "${PLAN}" --dry-run
+pdc-delete-migrated-sources --bucket "${BUCKET}" --profile "${AWS_PROFILE_NAME}" --plan "${PLAN}" --execute --max-objects 1000
+pdc-delete-migrated-sources --bucket "${BUCKET}" --profile "${AWS_PROFILE_NAME}" --plan "${PLAN}" --execute
+```
+
+Use `--all --exclude-family <name>` (repeatable) instead of `--family` to plan everything that is left after some families have been migrated.
+
+The execute and delete commands require either `--dry-run` or `--execute` and refuse to run with neither.
+
+### Resuming after an interruption
+
+Every command saves its progress after each batch (the plan in `<plan>.db`, the copy and delete steps in `<plan>.exec.db`). If a run stops because of a VPN drop, expired credentials or Ctrl-C, run the same command again and it continues where it stopped. A short outage is retried for up to 15 minutes before the command stops, and S3 throttling (`SlowDown`) is retried with exponential backoff; lower `--workers` if it keeps happening. Do not run two copies of the same command against one plan at the same time.
+
+The copy and delete steps are tied to the exact plan file they started with and refuse a plan that has changed.
+
+### Safety checks
+
+- The copy step never overwrites or deletes. On a fresh start it refuses to run if a destination prefix already holds objects.
+- A copy counts as verified only when its size, its ETag or CRC64NVME checksum, its user metadata and its content type match the source, and the source still has the size and ETag recorded in the plan.
+- The delete step removes only the exact keys named in the plan, never a prefix. It requires every copy to be verified (or `--allow-partial`), and it lists the destination to confirm each verified copy is still present with the planned size and ETag.
+- A `DROP` source is deleted only if the object that keeps its content has a verified copy and a fresh comparison of size, ETag and CRC64NVME between the two agrees.
+- Each deleted key is written to `<plan>.deleted.csv`, with where its content is kept, before it is deleted.
+
+### Restoring a deleted source
+
+A delete on a versioned bucket adds a delete marker; the data remains as a noncurrent version until a lifecycle rule removes it. To restore a source while that version still exists, list its versions and delete the delete marker:
+
+```bash
+KEY="<deleted-source-key>"
+aws s3api list-object-versions --bucket "${BUCKET}" --profile "${AWS_PROFILE_NAME}" --prefix "${KEY}"
+MARKER_VERSION_ID="<version-id-of-the-delete-marker>"
+aws s3api delete-object --bucket "${BUCKET}" --profile "${AWS_PROFILE_NAME}" --key "${KEY}" --version-id "${MARKER_VERSION_ID}"
+```
+
+If the bucket has a lifecycle rule that removes noncurrent versions, a deleted source cannot be restored after that rule has run. The content is still at the location recorded in `<plan>.deleted.csv`.
+
+### Output files
+
+| File | Contents |
+|------|----------|
+| `<plan>.csv` | One row per source object: `action`, `family`, `src_key`, `dst_key`, `size`, `etag`, `last_modified`, `mtime`, `reason`, `reference_key`, `version_id` |
+| `<plan>_review.csv` | Objects held out of the plan; they are left untouched |
+| `<plan>.db` | Planner working state (listing, metadata reads, label versions) |
+| `<plan>.exec.db` | Copy, verification and delete state |
+| `<plan>.deleted.csv` | Record of every deleted source key and where its content is kept |
+
+### Limitations
+
+- The prefixes `PDS4/` and `pds4/` are fixed in the tools.
+- An object larger than 5 GiB is reported as a failed copy; multipart copies are not implemented.
+- Listing is by prefix, so every object under the migrated prefixes is read once; plan one family at a time for the largest families and keep free disk space for the working state (roughly 0.7 KB per object).
+
+
 ## CloudFront Log Sync (`sync_cloudfront_logs.sh`)
 
 Copies CloudFront access logs from a source S3 bucket to a destination S3 bucket, downloading them locally as a staging step. Designed for cases where the two buckets live in **different AWS accounts**, making direct server-side copy impossible — you must authenticate to each account separately.
