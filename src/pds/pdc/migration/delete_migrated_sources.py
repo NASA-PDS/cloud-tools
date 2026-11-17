@@ -49,6 +49,7 @@ import csv
 import json
 import logging
 import sys
+import time
 from typing import Dict
 from typing import List
 from typing import Optional
@@ -73,6 +74,11 @@ log = logging.getLogger(__name__)
 DELETE_BATCH = 1000
 
 REMOVED = "removed"
+
+# DeleteObjects can report a transient error for single keys inside a successful response; retry those keys.
+RETRYABLE_KEY_ERRORS = ("InternalError", "SlowDown", "ServiceUnavailable", "RequestTimeout")
+KEY_ERROR_RETRIES = 5
+KEY_ERROR_DELAY_SECONDS = 2
 
 
 def content_matches(a: dict, b: dict) -> Optional[str]:
@@ -118,8 +124,19 @@ def delete_keys(s3, bucket: str, keys: List[str]) -> List[str]:
 
     On a versioned bucket this adds delete markers; it never removes a stored version.
     """
-    response = s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in keys], "Quiet": True})
-    return [e["Key"] for e in response.get("Errors", [])]
+    pending = list(keys)
+    for attempt in range(KEY_ERROR_RETRIES + 1):
+        response = s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in pending], "Quiet": True})
+        errors = response.get("Errors", [])
+        if not errors:
+            return []
+        for e in errors[:5]:
+            log.warning("S3 refused to delete %s: %s (%s)", e.get("Key"), e.get("Code"), e.get("Message"))
+        if attempt == KEY_ERROR_RETRIES or any(e.get("Code") not in RETRYABLE_KEY_ERRORS for e in errors):
+            return [e["Key"] for e in errors]
+        pending = [e["Key"] for e in errors]
+        time.sleep(KEY_ERROR_DELAY_SECONDS * 2**attempt)
+    return pending
 
 
 def delete_resumably(session: boto3.Session, bucket: str, keys: List[str]) -> List[str]:

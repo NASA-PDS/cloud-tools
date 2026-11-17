@@ -217,3 +217,29 @@ def test_delete_keys_reports_refused_deletes():
             return {"Errors": [{"Key": "PDS4/A/x", "Code": "AccessDenied"}]}
 
     assert dm.delete_keys(Refusing({}), "bkt", ["PDS4/A/x", "PDS4/A/y"]) == ["PDS4/A/x"]
+
+
+def test_delete_keys_retries_a_transient_per_key_error(monkeypatch):
+    monkeypatch.setattr(dm.time, "sleep", lambda seconds: None)
+    requests = []
+
+    class Flaky(FakeS3):
+        def delete_objects(self, Bucket, Delete):
+            keys = [o["Key"] for o in Delete["Objects"]]
+            requests.append(keys)
+            if len(requests) == 1:
+                return {"Errors": [{"Key": "PDS4/A/x", "Code": "InternalError", "Message": "try again"}]}
+            return {}
+
+    assert dm.delete_keys(Flaky({}), "bkt", ["PDS4/A/x", "PDS4/A/y"]) == []
+    assert requests == [["PDS4/A/x", "PDS4/A/y"], ["PDS4/A/x"]]
+
+
+def test_delete_keys_gives_up_on_a_persistent_transient_error(monkeypatch):
+    monkeypatch.setattr(dm.time, "sleep", lambda seconds: None)
+
+    class Stuck(FakeS3):
+        def delete_objects(self, Bucket, Delete):
+            return {"Errors": [{"Key": "PDS4/A/x", "Code": "SlowDown"}]}
+
+    assert dm.delete_keys(Stuck({}), "bkt", ["PDS4/A/x"]) == ["PDS4/A/x"]
